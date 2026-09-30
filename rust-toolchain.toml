@@ -1,0 +1,12 @@
+# Toolchain for the userspace server, fmt and clippy.
+#
+# Replace "stable" with an exact release (e.g. "1.xx.0", from `rustc --version`
+# in the dev container) to pin it, so clippy lints only change when the pin is
+# bumped deliberately.
+#
+# The eBPF crate (step 3) is built separately with nightly + rust-src, which
+# aya-build invokes itself; nightly is installed in the dev container image.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

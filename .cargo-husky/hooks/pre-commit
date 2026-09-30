@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if ! cargo fmt --check; then
+  echo "cargo fmt found issues. Run 'cargo fmt' and re-stage."
+  exit 1
+fi
+
+cargo clippy --all-targets -- -D warnings
+cargo test

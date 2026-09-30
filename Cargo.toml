@@ -1,0 +1,62 @@
+[package]
+name = "wire"
+version = "0.0.1"
+authors = ["stampatron"]
+edition = "2024"
+rust-version = "1.85"
+description = "A from-scratch HTTP/1.1 and WebSocket server that visualises live TCP connection data (TCP_INFO, eBPF) in the browser"
+repository = "https://github.com/stamps9k/wire"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+keywords = ["http", "websocket", "tcp", "ebpf", "networking"]
+categories = ["network-programming", "web-programming::http-server"]
+publish = false
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["full"] }
+libc = "0.2.189"
+
+[dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+
+[lints.rust]
+non_snake_case = "deny"
+non_camel_case_types = "deny"
+non_upper_case_globals = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_must_use = "deny"
+dead_code = "deny"
+
+[lints.clippy]
+# --- Enable the whole group at warn level ---
+pedantic = { level = "warn", priority = -1 }
+
+# --- Safety: no panics reachable from input ---
+unwrap_used = "deny"          # use proper error handling
+expect_used = "warn"          # at least forces a message, but still crashes
+panic = "deny"                # no panic!() calls
+todo = "deny"                 # no todo!() left in code
+unimplemented = "deny"        # no unimplemented!() left in code
+indexing_slicing = "deny"     # use .get() instead of [i] / [a..b], which panic out of range
+string_slice = "deny"         # &str slicing panics on non-char boundaries
+
+# --- Unsafe (libc / getsockopt) ---
+undocumented_unsafe_blocks = "deny"     # every unsafe block needs a // SAFETY: comment
+multiple_unsafe_ops_per_block = "deny"  # one unsafe operation per block
+
+# --- Style ---
+enum_glob_use = "deny"        # no `use MyEnum::*`
+wildcard_imports = "deny"     # no `use module::*`
+manual_string_new = "deny"    # use `String::new()` not `"".to_string()`
+redundant_closure = "deny"    # no `|x| foo(x)`, just use `foo`
+
+# --- Performance ---
+inefficient_to_string = "deny"        # avoid unnecessary string clones
+large_types_passed_by_value = "warn"  # pass large structs by reference
+redundant_clone = "deny"              # remove unnecessary .clone() calls
+
+# --- Correctness ---
+cast_lossless = "deny"                # use From/Into instead of `as` for lossless casts
+cast_possible_truncation = "warn"     # narrowing `as` casts
+arithmetic_side_effects = "warn"      # overflow on untrusted lengths; use checked_/saturating_
