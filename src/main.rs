@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod connection;
 mod method;
 mod request;
+mod request_error;
 mod target;
 mod version;
 

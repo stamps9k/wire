@@ -1,6 +1,7 @@
-use std::io::Error;
+use crate::request_error::RequestError::Malformed;
 
 use super::method::Method;
+use super::request_error::RequestError;
 use super::target::Target;
 use super::version::Version;
 
@@ -22,23 +23,23 @@ pub struct Request {
 }
 
 impl Request {
-  pub fn parse(request_line: &[u8]) -> Result<Request, Error> {
+  pub fn parse(request_line: &[u8]) -> Result<Request, RequestError> {
     let mut request_split = request_line.split(|b| *b == b' ');
-    let method_raw = request_split
-      .next()
-      .ok_or(Error::other("Malformed Request"))?;
+    let method_raw = request_split.next().ok_or(Malformed(
+      "Request not long enough to fetch method information",
+    ))?;
 
-    let target_raw = request_split
-      .next()
-      .ok_or(Error::other("Malformed Request"))?;
+    let target_raw = request_split.next().ok_or(Malformed(
+      "Request not long enough to fetch target information",
+    ))?;
 
-    let version_raw = request_split
-      .next()
-      .ok_or(Error::other("Malformed Request"))?;
+    let version_raw = request_split.next().ok_or(Malformed(
+      "Request not long enough to fetch version information",
+    ))?;
 
     //Check that the request did not include extra invalid information
     if request_split.next().is_some() {
-      return Err(Error::other("Malformed Request"));
+      return Err(Malformed("Superfluous information included in the request"));
     }
 
     Ok(Request {

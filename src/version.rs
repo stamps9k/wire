@@ -1,4 +1,6 @@
-use std::io::Error;
+use crate::request_error::RequestError::Malformed;
+
+use super::request_error::RequestError;
 
 pub struct Version {
   pub major: u8,
@@ -6,12 +8,12 @@ pub struct Version {
 }
 
 impl Version {
-  pub fn parse(version_raw: &[u8]) -> Result<Version, Error> {
+  pub fn parse(version_raw: &[u8]) -> Result<Version, RequestError> {
     let Some(rest) = version_raw.strip_prefix(b"HTTP/") else {
-      return Err(Error::other("Malformed Request"));
+      return Err(Malformed("Version missing the HTTP prefix"));
     };
     let [major @ b'0'..=b'9', b'.', minor @ b'0'..=b'9'] = rest else {
-      return Err(Error::other("Malformed Request"));
+      return Err(Malformed("Major minor versions not single digit numbers"));
     };
 
     let version = Version {

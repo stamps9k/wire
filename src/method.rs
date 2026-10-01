@@ -1,6 +1,7 @@
 use super::request::is_token;
-use std::io::Error;
 use std::str;
+
+use super::request_error::RequestError;
 
 pub enum Method {
   Get,
@@ -16,9 +17,9 @@ pub enum Method {
 }
 
 impl Method {
-  pub fn parse(method_raw: &[u8]) -> Result<Method, Error> {
+  pub fn parse(method_raw: &[u8]) -> Result<Method, RequestError> {
     if !is_token(method_raw) {
-      return Err(Error::other("Malformed Request"));
+      return Err(RequestError::Malformed("Not a valid token"));
     }
 
     let method = match method_raw {
@@ -33,7 +34,7 @@ impl Method {
       b"PATCH" => Method::Patch,
       _ => Method::Other(
         str::from_utf8(method_raw)
-          .map_err(|_| Error::other("method is not ASCII"))?
+          .map_err(|_| RequestError::Malformed("method is not ASCII"))?
           .to_owned(),
       ),
     };

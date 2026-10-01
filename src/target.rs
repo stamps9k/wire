@@ -1,5 +1,6 @@
-use std::io::Error;
 use std::str;
+
+use crate::request_error::RequestError::{self, Malformed};
 
 pub enum Target {
   Origin(String),    // "/search?q=foo"
@@ -9,14 +10,14 @@ pub enum Target {
 }
 
 impl Target {
-  pub fn parse(target_raw: &[u8]) -> Result<Target, Error> {
+  pub fn parse(target_raw: &[u8]) -> Result<Target, RequestError> {
     //First reject empty strings and non ascii characters
     if target_raw.is_empty() || !target_raw.iter().all(u8::is_ascii_graphic) {
-      return Err(Error::other("Malformed Request"));
+      return Err(Malformed("Invalid target - empty or not ascii graphics"));
     }
 
     let t_contents = str::from_utf8(target_raw)
-      .map_err(|_| Error::other("target is not ASCII"))?
+      .map_err(|_| Malformed("target is not ASCII"))?
       .to_owned();
 
     let target: Target = match target_raw {
@@ -24,7 +25,7 @@ impl Target {
       t if t.starts_with(b"/") => Target::Origin(t_contents),
       t if Target::is_absolute(t) => Target::Absolute(t_contents),
       t if Target::is_authority(t) => Target::Authority(t_contents),
-      _ => return Err(Error::other("Malformed Request")),
+      _ => return Err(Malformed("Request does not match any target type")),
     };
 
     Ok(target)

@@ -1,8 +1,9 @@
 //! Per-connection handling: reads the request head and writes the response.
 
-use crate::io::Result;
+use crate::request_error::RequestError;
+use crate::request_error::RequestError::Malformed;
 
-use std::io::Error;
+use std::io;
 use std::net::SocketAddr;
 
 use tokio::io::AsyncReadExt;
@@ -17,44 +18,43 @@ use super::target::Target;
 
 /// Serves one client connection from start to finish.
 ///
-/// Reads the request head with a 10-second deadline, logs it, and sends the
-/// response. The connection is closed when this function returns, whichever
-/// path it takes.
+/// Reads the request head with a 10-second deadline, parses the request line,
+/// logs it, and sends the response. The connection is closed when this
+/// function returns, whichever path it takes.
 ///
-/// A client that disconnects early, sends an over-long head, or times out is
-/// dropped without a response, and that is not treated as an error.
+/// A client that does not send a complete head within the deadline is logged
+/// and dropped without a response, and that is not treated as an error.
 ///
 /// # Errors
 ///
-/// Returns an error if reading from or writing to the socket fails, for
-/// example because the client reset the connection.
-pub async fn handle(mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
+/// Returns [`RequestError::Closed`] or [`RequestError::TooLarge`] if the head
+/// cannot be read, [`RequestError::Malformed`] if the request line is invalid,
+/// and [`RequestError::Io`] if reading from or writing to the socket fails.
+/// No response is sent in any of these cases.
+pub async fn handle(
+  mut stream: TcpStream,
+  addr: SocketAddr,
+) -> Result<(), RequestError> {
   println!("new client: {addr:?}");
 
-  let header: Vec<u8> =
-    match timeout(Duration::from_secs(10), read_head(&mut stream)).await {
-      Ok(Ok(Some(h))) => h, // got a complete head in time
-      Ok(Ok(None)) => {
-        println!("{addr}: closed before head complete");
-        return Ok(());
-      }
-      Ok(Err(e)) => return Err(e), // I/O error
-      Err(_) => {
-        println!("{addr}: header timeout");
-        return Ok(()); // timed out
-      }
-    };
+  let Ok(result) =
+    timeout(Duration::from_secs(10), read_head(&mut stream)).await
+  else {
+    eprintln!("{addr}: header timeout");
+    return Ok(()); // timed out
+  };
+  let header = result?;
 
   println!("Header is {:?}", String::from_utf8_lossy(&header));
 
   let line_end = header
     .windows(2)
     .position(|w| w == b"\r\n")
-    .ok_or_else(|| Error::other("no CRLF in head"))?;
+    .ok_or(Malformed("no CRLF in head"))?;
 
   let request_raw: &[u8] = header
     .get(..line_end)
-    .ok_or_else(|| Error::other("line end out of range"))?;
+    .ok_or(Malformed("line end out of range"))?;
 
   let request = Request::parse(request_raw)?;
 
@@ -92,7 +92,7 @@ pub async fn handle(mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
 async fn handle_request(
   stream: &mut TcpStream,
   _header: Vec<u8>,
-) -> Result<()> {
+) -> Result<(), RequestError> {
   let body = "<!doctype html><title>wire</title><p>hello</p>";
   let head = format!(
     "HTTP/1.1 200 OK\r\n\
@@ -113,30 +113,31 @@ async fn handle_request(
 /// Reads in 1 KiB chunks and accumulates them in a buffer until `\r\n\r\n`
 /// is found. The returned buffer may contain bytes past the terminator.
 ///
-/// Returns `Ok(None)` if the client closes the connection before the head is
-/// complete, or if the head exceeds 8 KiB.
-///
 /// # Errors
 ///
-/// Returns an error if reading from the socket fails, for example on a
+/// Returns [`RequestError::Closed`] if the client closes the connection before
+/// the head is complete, [`RequestError::TooLarge`] if the head exceeds 8 KiB,
+/// and [`RequestError::Io`] if reading from the socket fails, for example on a
 /// connection reset.
-async fn read_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, RequestError> {
   let mut data: Vec<u8> = Vec::new();
 
   let mut chunk = [0u8; 1024];
   loop {
     let n = stream.read(&mut chunk).await?;
     if n == 0 {
-      return Ok(None); // client closed before finishing the head
+      return Err(RequestError::Closed); // client closed before finishing the head
     }
 
     let Some(bytes) = chunk.get(..n) else {
-      return Err(Error::other("read returned more bytes than the buffer"));
+      return Err(
+        io::Error::other("read returned more bytes than the buffer").into(),
+      );
     };
     data.extend_from_slice(bytes);
 
     if data.len() > 8 * 1024 {
-      return Ok(None);
+      return Err(RequestError::TooLarge);
     }
 
     if let Some(_pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -144,5 +145,5 @@ async fn read_head(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
     }
   }
 
-  Ok(Some(data))
+  Ok(data)
 }
