@@ -6,6 +6,10 @@ use std::io;
 use tokio::net::TcpListener;
 
 mod connection;
+mod method;
+mod request;
+mod target;
+mod version;
 
 /// Binds to port 8080 on all interfaces and serves each accepted connection
 /// in its own task.

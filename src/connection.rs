@@ -11,6 +11,10 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
+use super::method::Method;
+use super::request::Request;
+use super::target::Target;
+
 /// Serves one client connection from start to finish.
 ///
 /// Reads the request head with a 10-second deadline, logs it, and sends the
@@ -42,6 +46,24 @@ pub async fn handle(mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
     };
 
   println!("Header is {:?}", String::from_utf8_lossy(&header));
+
+  let request = Request::parse(&String::from_utf8_lossy(&header))?;
+
+  //TMP log to suppress unused error
+  match request.target {
+    Target::Origin(path) => println!("path is {path}"),
+    Target::Absolute(uri) => println!("absolute: {uri}"),
+    Target::Authority(host_port) => println!("connect to {host_port}"),
+    Target::Asterisk => println!("server-wide"),
+  }
+  if let Method::Other(s) = request.method {
+    println!("Non standard method: {s:?}");
+  }
+
+  let major: u8 = request.version.major;
+  let minor: u8 = request.version.minor;
+  println!("Major - {major :?}");
+  println!("Minor - {minor :?}");
 
   // Send response
   handle_request(&mut stream, header).await?;
