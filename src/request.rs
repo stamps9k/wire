@@ -10,8 +10,8 @@ fn is_tchar(b: u8) -> bool {
   b'|' | b'~')
 }
 
-pub fn is_token(string: &str) -> bool {
-  !string.is_empty() && string.bytes().all(is_tchar)
+pub fn is_token(b: &[u8]) -> bool {
+  !b.is_empty() && b.iter().all(|bb| is_tchar(*bb))
 }
 
 pub struct Request {
@@ -22,13 +22,8 @@ pub struct Request {
 }
 
 impl Request {
-  pub fn parse(header: &str) -> Result<Request, Error> {
-    let mut header_split = header.split("\r\n");
-
-    let request_line =
-      header_split.next().ok_or(Error::other("Empty request"))?;
-
-    let mut request_split = request_line.split(' ');
+  pub fn parse(request_line: &[u8]) -> Result<Request, Error> {
+    let mut request_split = request_line.split(|b| *b == b' ');
     let method_raw = request_split
       .next()
       .ok_or(Error::other("Malformed Request"))?;

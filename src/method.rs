@@ -1,5 +1,6 @@
 use super::request::is_token;
 use std::io::Error;
+use std::str;
 
 pub enum Method {
   Get,
@@ -15,22 +16,26 @@ pub enum Method {
 }
 
 impl Method {
-  pub fn parse(method_raw: &str) -> Result<Method, Error> {
+  pub fn parse(method_raw: &[u8]) -> Result<Method, Error> {
     if !is_token(method_raw) {
       return Err(Error::other("Malformed Request"));
     }
 
     let method = match method_raw {
-      "GET" => Method::Get,
-      "HEAD" => Method::Head,
-      "POST" => Method::Post,
-      "PUT" => Method::Put,
-      "DELETE" => Method::Delete,
-      "CONNECT" => Method::Connect,
-      "OPTIONS" => Method::Options,
-      "TRACE" => Method::Trace,
-      "PATCH" => Method::Patch,
-      _ => Method::Other(method_raw.to_string()),
+      b"GET" => Method::Get,
+      b"HEAD" => Method::Head,
+      b"POST" => Method::Post,
+      b"PUT" => Method::Put,
+      b"DELETE" => Method::Delete,
+      b"CONNECT" => Method::Connect,
+      b"OPTIONS" => Method::Options,
+      b"TRACE" => Method::Trace,
+      b"PATCH" => Method::Patch,
+      _ => Method::Other(
+        str::from_utf8(method_raw)
+          .map_err(|_| Error::other("method is not ASCII"))?
+          .to_owned(),
+      ),
     };
 
     Ok(method)
@@ -43,81 +48,91 @@ mod tests {
 
   #[test]
   fn known_method_get() {
-    assert!(matches!(Method::parse("GET"), Ok(Method::Get)));
+    assert!(matches!(Method::parse(b"GET"), Ok(Method::Get)));
   }
 
   #[test]
   fn known_method_head() {
-    assert!(matches!(Method::parse("HEAD"), Ok(Method::Head)));
+    assert!(matches!(Method::parse(b"HEAD"), Ok(Method::Head)));
   }
 
   #[test]
   fn known_method_post() {
-    assert!(matches!(Method::parse("POST"), Ok(Method::Post)));
+    assert!(matches!(Method::parse(b"POST"), Ok(Method::Post)));
   }
 
   #[test]
   fn known_method_put() {
-    assert!(matches!(Method::parse("PUT"), Ok(Method::Put)));
+    assert!(matches!(Method::parse(b"PUT"), Ok(Method::Put)));
   }
 
   #[test]
   fn known_method_delete() {
-    assert!(matches!(Method::parse("DELETE"), Ok(Method::Delete)));
+    assert!(matches!(Method::parse(b"DELETE"), Ok(Method::Delete)));
   }
 
   #[test]
   fn known_method_connect() {
-    assert!(matches!(Method::parse("CONNECT"), Ok(Method::Connect)));
+    assert!(matches!(Method::parse(b"CONNECT"), Ok(Method::Connect)));
   }
 
   #[test]
   fn known_method_options() {
-    assert!(matches!(Method::parse("OPTIONS"), Ok(Method::Options)));
+    assert!(matches!(Method::parse(b"OPTIONS"), Ok(Method::Options)));
   }
 
   #[test]
   fn known_method_trace() {
-    assert!(matches!(Method::parse("TRACE"), Ok(Method::Trace)));
+    assert!(matches!(Method::parse(b"TRACE"), Ok(Method::Trace)));
   }
 
   #[test]
   fn known_method_patch() {
-    assert!(matches!(Method::parse("PATCH"), Ok(Method::Patch)));
+    assert!(matches!(Method::parse(b"PATCH"), Ok(Method::Patch)));
   }
 
   #[test]
   fn lowercase_method_maps_to_other() {
     assert!(
-      matches!(Method::parse("get"), Ok(Method::Other(ref m)) if m == "get")
+      matches!(Method::parse(b"get"), Ok(Method::Other(ref m)) if m == "get")
     );
   }
 
   #[test]
   fn unknown_token_with_symbols_maps_to_other() {
     assert!(matches!(
-      Method::parse("M-SEARCH"),
+      Method::parse(b"M-SEARCH"),
       Ok(Method::Other(ref m)) if m == "M-SEARCH"
     ));
   }
 
   #[test]
   fn rejects_empty_string() {
-    assert!(Method::parse("").is_err());
+    assert!(Method::parse(b"").is_err());
   }
 
   #[test]
   fn rejects_non_token() {
-    assert!(Method::parse("@").is_err());
+    assert!(Method::parse(b"@").is_err());
   }
 
   #[test]
   fn rejects_binary() {
-    assert!(Method::parse("G\tET").is_err());
+    assert!(Method::parse(b"G\tET").is_err());
   }
 
   #[test]
   fn rejects_non_ascii() {
-    assert!(Method::parse("GÉT").is_err());
+    assert!(Method::parse("GÉT".as_bytes()).is_err());
+  }
+
+  #[test]
+  fn rejects_invalid_utf8() {
+    assert!(Method::parse(b"G\xFFT").is_err());
+  }
+
+  #[test]
+  fn rejects_lone_continuation_byte() {
+    assert!(Method::parse(b"\x80GET").is_err());
   }
 }

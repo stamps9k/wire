@@ -47,7 +47,16 @@ pub async fn handle(mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
 
   println!("Header is {:?}", String::from_utf8_lossy(&header));
 
-  let request = Request::parse(&String::from_utf8_lossy(&header))?;
+  let line_end = header
+    .windows(2)
+    .position(|w| w == b"\r\n")
+    .ok_or_else(|| Error::other("no CRLF in head"))?;
+
+  let request_raw: &[u8] = header
+    .get(..line_end)
+    .ok_or_else(|| Error::other("line end out of range"))?;
+
+  let request = Request::parse(request_raw)?;
 
   //TMP log to suppress unused error
   match request.target {

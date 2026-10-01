@@ -1,4 +1,5 @@
 use std::io::Error;
+use std::str;
 
 pub enum Target {
   Origin(String),    // "/search?q=foo"
@@ -8,28 +9,36 @@ pub enum Target {
 }
 
 impl Target {
-  pub fn parse(target_raw: &str) -> Result<Target, Error> {
+  pub fn parse(target_raw: &[u8]) -> Result<Target, Error> {
     //First reject empty strings and non ascii characters
-    if target_raw.is_empty()
-      || !target_raw.bytes().all(|b| b.is_ascii_graphic())
-    {
+    if target_raw.is_empty() || !target_raw.iter().all(u8::is_ascii_graphic) {
       return Err(Error::other("Malformed Request"));
     }
 
+    let t_contents = str::from_utf8(target_raw)
+      .map_err(|_| Error::other("target is not ASCII"))?
+      .to_owned();
+
     let target: Target = match target_raw {
-      "*" => Target::Asterisk,
-      t if t.starts_with('/') => Target::Origin(t.to_string()),
-      t if Target::is_absolute(t) => Target::Absolute(t.to_string()),
-      t if Target::is_authority(t) => Target::Authority(t.to_string()),
+      b"*" => Target::Asterisk,
+      t if t.starts_with(b"/") => Target::Origin(t_contents),
+      t if Target::is_absolute(t) => Target::Absolute(t_contents),
+      t if Target::is_authority(t) => Target::Authority(t_contents),
       _ => return Err(Error::other("Malformed Request")),
     };
 
     Ok(target)
   }
 
-  fn is_absolute(s: &str) -> bool {
+  fn is_absolute(s: &[u8]) -> bool {
     // Split at the :// separator.
-    let Some((scheme, rest)) = s.split_once("://") else {
+    let Some(i) = s.iter().position(|&b| b == b':') else {
+      return false;
+    };
+    let Some((scheme, rest)) = s.split_at_checked(i) else {
+      return false;
+    };
+    let Some(rest) = rest.strip_prefix(b"://") else {
       return false;
     };
 
@@ -39,9 +48,9 @@ impl Target {
     scheme_check && rest_check
   }
 
-  fn is_scheme(s: &str) -> bool {
+  fn is_scheme(s: &[u8]) -> bool {
     /* first is a letter, every byte in rest is allowed */
-    match s.as_bytes() {
+    match s {
       [b'a'..=b'z' | b'A'..=b'Z', rest @ ..] => rest
         .iter()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')),
@@ -49,26 +58,33 @@ impl Target {
     }
   }
 
-  fn is_authority(s: &str) -> bool {
-    // Split at the LAST colon so IPv6 literals keep their inner colons.
-    let Some((host, port)) = s.rsplit_once(':') else {
+  fn is_authority(s: &[u8]) -> bool {
+    let Some(i) = s.iter().rposition(|&b| b == b':') else {
+      return false;
+    };
+    let Some((host, rest)) = s.split_at_checked(i) else {
+      return false;
+    };
+    let Some(port) = rest.strip_prefix(b":") else {
       return false;
     };
 
-    let port_ok = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    let port_ok = !port.is_empty() && port.iter().all(u8::is_ascii_digit);
 
-    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))
-    {
-      // Bracketed IPv6 literal: loose check, fine for classification.
-      Some(ip6) => {
-        !ip6.is_empty()
-          && ip6
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
-      }
-      // Hostname or IPv4.
-      None => !host.is_empty() && host.bytes().all(Target::is_reg_name_char),
-    };
+    let host_ok =
+      match host.strip_prefix(b"[").and_then(|h| h.strip_suffix(b"]")) {
+        // Bracketed IPv6 literal: loose check, fine for classification.
+        Some(ip6) => {
+          !ip6.is_empty()
+            && ip6
+              .iter()
+              .all(|&b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        }
+        // Hostname or IPv4.
+        None => {
+          !host.is_empty() && host.iter().copied().all(Target::is_reg_name_char)
+        }
+      };
 
     port_ok && host_ok
   }
@@ -90,53 +106,68 @@ mod tests {
   #[test]
   fn valid_origin() {
     assert!(matches!(
-      Target::parse("/example"),
+      Target::parse(b"/example"),
       Ok(Target::Origin(ref m)) if m == "/example"
     ));
   }
 
   #[test]
   fn invalid_origin_noslash() {
-    assert!(Target::parse("example").is_err());
+    assert!(Target::parse(b"example").is_err());
   }
 
   #[test]
   fn invalid_origin_nonascii() {
-    assert!(Target::parse("/é").is_err());
+    assert!(Target::parse("/é".as_bytes()).is_err());
+  }
+
+  #[test]
+  fn invalid_origin_invalid_utf8() {
+    assert!(Target::parse(b"/\xFF").is_err());
+  }
+
+  #[test]
+  fn invalid_absolute_invalid_utf8() {
+    assert!(Target::parse(b"http://ex\xFEample.com").is_err());
+  }
+
+  #[test]
+  fn invalid_authority_invalid_utf8() {
+    assert!(Target::parse(b"ex\xC3ample.com:443").is_err());
   }
 
   #[test]
   fn invalid_origin_control_byte() {
-    assert!(Target::parse("/foo\x01").is_err());
+    assert!(Target::parse(b"/foo\x01").is_err());
   }
 
   #[test]
   fn valid_absolute() {
     assert!(matches!(
-      Target::parse("http://example.com"),
+      Target::parse(b"http://example.com"),
       Ok(Target::Absolute(ref m)) if m == "http://example.com"
     ));
   }
 
   #[test]
   fn invalid_absolute_malformed_scheme() {
-    assert!(Target::parse("h@p://x").is_err());
+    assert!(Target::parse(b"h@p://x").is_err());
   }
 
   #[test]
   fn invalid_absolute_numeric_start() {
-    assert!(Target::parse("1http://example.com").is_err());
+    assert!(Target::parse(b"1http://example.com").is_err());
   }
 
   #[test]
   fn invalid_absolute_empty_rest() {
-    assert!(Target::parse("http://").is_err());
+    assert!(Target::parse(b"http://").is_err());
   }
 
   #[test]
   fn valid_absolute_scheme_symbols() {
     assert!(matches!(
-      Target::parse("a+b-c.d://x"),
+      Target::parse(b"a+b-c.d://x"),
       Ok(Target::Absolute(ref m)) if m == "a+b-c.d://x"
     ));
   }
@@ -144,7 +175,7 @@ mod tests {
   #[test]
   fn valid_absolute_uppercase_scheme() {
     assert!(matches!(
-      Target::parse("HTTP://example.com:443"),
+      Target::parse(b"HTTP://example.com:443"),
       Ok(Target::Absolute(ref m)) if m == "HTTP://example.com:443"
     ));
   }
@@ -152,7 +183,7 @@ mod tests {
   #[test]
   fn valid_authority_alphanumeric() {
     assert!(matches!(
-      Target::parse("example.com:443"),
+      Target::parse(b"example.com:443"),
       Ok(Target::Authority(ref m)) if m == "example.com:443"
     ));
   }
@@ -160,43 +191,43 @@ mod tests {
   #[test]
   fn valid_authority_ipv6() {
     assert!(matches!(
-      Target::parse("[::1]:8080"),
+      Target::parse(b"[::1]:8080"),
       Ok(Target::Authority(ref m)) if m == "[::1]:8080"
     ));
   }
 
   #[test]
   fn invalid_authority_noport() {
-    assert!(Target::parse("example.com:").is_err());
+    assert!(Target::parse(b"example.com:").is_err());
   }
 
   #[test]
   fn invalid_authority_malformed_port() {
-    assert!(Target::parse("example.com:$").is_err());
+    assert!(Target::parse(b"example.com:$").is_err());
   }
 
   #[test]
   fn invalid_authority_nohost() {
-    assert!(Target::parse(":443").is_err());
+    assert!(Target::parse(b":443").is_err());
   }
 
   #[test]
   fn invalid_authority_malformed_host() {
-    assert!(Target::parse("@:443").is_err());
+    assert!(Target::parse(b"@:443").is_err());
   }
 
   #[test]
   fn valid_asterisk() {
-    assert!(matches!(Target::parse("*"), Ok(Target::Asterisk)));
+    assert!(matches!(Target::parse(b"*"), Ok(Target::Asterisk)));
   }
 
   #[test]
   fn invalid_asterisk() {
-    assert!(Target::parse("*x").is_err());
+    assert!(Target::parse(b"*x").is_err());
   }
 
   #[test]
   fn invalid_empty_string() {
-    assert!(Target::parse("").is_err());
+    assert!(Target::parse(b"").is_err());
   }
 }
