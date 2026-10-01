@@ -5,16 +5,6 @@ use super::request_error::RequestError;
 use super::target::Target;
 use super::version::Version;
 
-fn is_tchar(b: u8) -> bool {
-  matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'!' | b'#' | b'$' |
-  b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' |
-  b'|' | b'~')
-}
-
-pub fn is_token(b: &[u8]) -> bool {
-  !b.is_empty() && b.iter().all(|bb| is_tchar(*bb))
-}
-
 pub struct Request {
   pub method: Method,
   pub target: Target,

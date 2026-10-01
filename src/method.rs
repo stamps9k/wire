@@ -1,4 +1,4 @@
-use super::request::is_token;
+use super::grammar::is_token;
 use std::str;
 
 use super::request_error::RequestError;
