@@ -82,6 +82,44 @@ impl Request {
       headers: parse_headers(rest)?,
     })
   }
+
+  /// Checks the rules that apply to the request as a whole, beyond the
+  /// grammar that [`Request::parse`] has already checked.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RequestError::Malformed`] if any rule is broken.
+  pub fn validate(&self) -> Result<(), RequestError> {
+    self.validate_host()?;
+
+    Ok(())
+  }
+
+  /// Checks the number of Host headers (RFC 9112 section 3.2).
+  ///
+  /// An HTTP/1.0 request may omit Host. Every other version needs exactly
+  /// one, and no version may repeat it.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RequestError::Malformed`] if Host is repeated, or if it is
+  /// missing from a request that is not HTTP/1.0.
+  fn validate_host(&self) -> Result<(), RequestError> {
+    let host_headers = self.headers.iter().filter(|h| h.name == "host");
+
+    //Check for all versions that host headers does not exceed 1
+    if host_headers.clone().count() > 1 {
+      return Err(Malformed("host header repeated"));
+    }
+
+    //Check for all versions outside 1.0 that host headers is not 0
+    let is_v1_0 = self.version.major == 1 && self.version.minor == 0;
+    if !is_v1_0 && host_headers.count() == 0 {
+      return Err(Malformed("host header missing"));
+    }
+
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -197,5 +235,70 @@ mod tests {
   #[test]
   fn rejects_header_without_line_ending() {
     assert!(Request::parse(b"GET / HTTP/1.1\r\nHost: a").is_err());
+  }
+
+  /// Parses a head and runs `validate` on the result.
+  fn validated(raw: &[u8]) -> Result<(), RequestError> {
+    Request::parse(raw)?.validate()
+  }
+
+  #[test]
+  fn single_host_is_valid() {
+    assert!(validated(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn host_name_case_is_ignored() {
+    assert!(validated(b"GET / HTTP/1.1\r\nhOsT: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn missing_host_on_http_1_1_is_rejected() {
+    assert!(matches!(
+      validated(b"GET / HTTP/1.1\r\nAccept: */*\r\n\r\n"),
+      Err(Malformed("host header missing"))
+    ));
+  }
+
+  #[test]
+  fn missing_host_on_http_1_2_is_rejected() {
+    assert!(matches!(
+      validated(b"GET / HTTP/1.2\r\n\r\n"),
+      Err(Malformed("host header missing"))
+    ));
+  }
+
+  #[test]
+  fn missing_host_on_http_1_0_is_valid() {
+    assert!(validated(b"GET / HTTP/1.0\r\nAccept: */*\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn single_host_on_http_1_0_is_valid() {
+    assert!(validated(b"GET / HTTP/1.0\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn repeated_host_is_rejected() {
+    assert!(matches!(
+      validated(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+      Err(Malformed("host header repeated"))
+    ));
+  }
+
+  #[test]
+  fn repeated_host_in_mixed_case_is_rejected() {
+    assert!(matches!(
+      validated(b"GET / HTTP/1.1\r\nHost: a\r\nHOST: a\r\n\r\n"),
+      Err(Malformed("host header repeated"))
+    ));
+  }
+
+  #[test]
+  fn repeated_host_on_http_1_0_is_rejected() {
+    assert!(matches!(
+      validated(b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"),
+      Err(Malformed("host header repeated"))
+    ));
   }
 }

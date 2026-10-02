@@ -28,8 +28,9 @@ use super::target::Target;
 ///
 /// Returns [`RequestError::Closed`] or [`RequestError::TooLarge`] if the head
 /// cannot be read, [`RequestError::Malformed`] if the request line or a header
-/// field is invalid, and [`RequestError::Io`] if reading from or writing to
-/// the socket fails. No response is sent in any of these cases.
+/// field is invalid or the request fails validation, and [`RequestError::Io`]
+/// if reading from or writing to the socket fails. No response is sent in any
+/// of these cases.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
@@ -47,6 +48,7 @@ pub async fn handle(
   println!("Header is {:?}", String::from_utf8_lossy(&header));
 
   let request = Request::parse(&header)?;
+  request.validate()?;
 
   //TMP log to suppress unused error
   match request.target {
