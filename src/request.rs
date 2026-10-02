@@ -91,6 +91,7 @@ impl Request {
   /// Returns [`RequestError::Malformed`] if any rule is broken.
   pub fn validate(&self) -> Result<(), RequestError> {
     self.validate_host()?;
+    self.validate_target_form()?;
 
     Ok(())
   }
@@ -119,6 +120,33 @@ impl Request {
     }
 
     Ok(())
+  }
+
+  /// Checks that the target form fits the method (RFC 9112 section 3.2).
+  ///
+  /// CONNECT must use authority-form and no other method may. Asterisk-form
+  /// is only for OPTIONS. Origin-form and absolute-form suit every method
+  /// except CONNECT.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RequestError::Malformed`] if the method and target form do
+  /// not go together.
+  fn validate_target_form(&self) -> Result<(), RequestError> {
+    match (&self.method, &self.target) {
+      (Method::Connect, Target::Authority(_))
+      | (Method::Options, Target::Asterisk) => Ok(()),
+      (Method::Connect, _) => {
+        Err(Malformed("connect target is not authority-form"))
+      }
+      (_, Target::Authority(_)) => {
+        Err(Malformed("authority-form target without connect"))
+      }
+      (_, Target::Asterisk) => {
+        Err(Malformed("asterisk-form target without options"))
+      }
+      (_, _) => Ok(()),
+    }
   }
 }
 
@@ -300,5 +328,94 @@ mod tests {
       validated(b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"),
       Err(Malformed("host header repeated"))
     ));
+  }
+
+  #[test]
+  fn connect_with_authority_is_valid() {
+    assert!(validated(b"CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn connect_with_origin_is_rejected() {
+    assert!(matches!(
+      validated(b"CONNECT / HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("connect target is not authority-form"))
+    ));
+  }
+
+  #[test]
+  fn connect_with_absolute_is_rejected() {
+    assert!(matches!(
+      validated(b"CONNECT http://a/ HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("connect target is not authority-form"))
+    ));
+  }
+
+  #[test]
+  fn connect_with_asterisk_is_rejected() {
+    assert!(matches!(
+      validated(b"CONNECT * HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("connect target is not authority-form"))
+    ));
+  }
+
+  #[test]
+  fn get_with_authority_is_rejected() {
+    assert!(matches!(
+      validated(b"GET a:443 HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("authority-form target without connect"))
+    ));
+  }
+
+  #[test]
+  fn options_with_authority_is_rejected() {
+    assert!(matches!(
+      validated(b"OPTIONS a:443 HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("authority-form target without connect"))
+    ));
+  }
+
+  #[test]
+  fn other_method_with_authority_is_rejected() {
+    assert!(matches!(
+      validated(b"PURGE a:443 HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("authority-form target without connect"))
+    ));
+  }
+
+  #[test]
+  fn options_with_asterisk_is_valid() {
+    assert!(validated(b"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn options_with_origin_is_valid() {
+    assert!(validated(b"OPTIONS /x HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn get_with_asterisk_is_rejected() {
+    assert!(matches!(
+      validated(b"GET * HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("asterisk-form target without options"))
+    ));
+  }
+
+  #[test]
+  fn other_method_with_asterisk_is_rejected() {
+    assert!(matches!(
+      validated(b"PURGE * HTTP/1.1\r\nHost: a\r\n\r\n"),
+      Err(Malformed("asterisk-form target without options"))
+    ));
+  }
+
+  #[test]
+  fn get_with_absolute_is_valid() {
+    assert!(validated(b"GET http://a/ HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  #[test]
+  fn other_method_with_origin_is_valid() {
+    assert!(validated(b"PURGE / HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
   }
 }
