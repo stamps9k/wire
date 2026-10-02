@@ -19,7 +19,7 @@ pub enum Method {
 impl Method {
   pub fn parse(method_raw: &[u8]) -> Result<Method, RequestError> {
     if !is_token(method_raw) {
-      return Err(RequestError::Malformed("Not a valid token"));
+      return Err(RequestError::Malformed("method is not a token"));
     }
 
     let method = match method_raw {

@@ -1,7 +1,6 @@
 //! Per-connection handling: reads the request head and writes the response.
 
 use crate::request_error::RequestError;
-use crate::request_error::RequestError::Malformed;
 
 use std::io;
 use std::net::SocketAddr;
@@ -18,9 +17,9 @@ use super::target::Target;
 
 /// Serves one client connection from start to finish.
 ///
-/// Reads the request head with a 10-second deadline, parses the request line,
-/// logs it, and sends the response. The connection is closed when this
-/// function returns, whichever path it takes.
+/// Reads the request head with a 10-second deadline, parses the request line
+/// and header fields, logs them, and sends the response. The connection is
+/// closed when this function returns, whichever path it takes.
 ///
 /// A client that does not send a complete head within the deadline is logged
 /// and dropped without a response, and that is not treated as an error.
@@ -28,9 +27,9 @@ use super::target::Target;
 /// # Errors
 ///
 /// Returns [`RequestError::Closed`] or [`RequestError::TooLarge`] if the head
-/// cannot be read, [`RequestError::Malformed`] if the request line is invalid,
-/// and [`RequestError::Io`] if reading from or writing to the socket fails.
-/// No response is sent in any of these cases.
+/// cannot be read, [`RequestError::Malformed`] if the request line or a header
+/// field is invalid, and [`RequestError::Io`] if reading from or writing to
+/// the socket fails. No response is sent in any of these cases.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
@@ -47,16 +46,7 @@ pub async fn handle(
 
   println!("Header is {:?}", String::from_utf8_lossy(&header));
 
-  let line_end = header
-    .windows(2)
-    .position(|w| w == b"\r\n")
-    .ok_or(Malformed("no CRLF in head"))?;
-
-  let request_raw: &[u8] = header
-    .get(..line_end)
-    .ok_or(Malformed("line end out of range"))?;
-
-  let request = Request::parse(request_raw)?;
+  let request = Request::parse(&header)?;
 
   //TMP log to suppress unused error
   match request.target {
@@ -67,6 +57,11 @@ pub async fn handle(
   }
   if let Method::Other(s) = request.method {
     println!("Non standard method: {s:?}");
+  }
+
+  //TMP log all headers
+  for h in &request.headers {
+    println!("{}: {}", h.name, h.value.escape_ascii());
   }
 
   let major: u8 = request.version.major;

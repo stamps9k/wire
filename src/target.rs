@@ -13,7 +13,7 @@ impl Target {
   pub fn parse(target_raw: &[u8]) -> Result<Target, RequestError> {
     //First reject empty strings and non ascii characters
     if target_raw.is_empty() || !target_raw.iter().all(u8::is_ascii_graphic) {
-      return Err(Malformed("Invalid target - empty or not ascii graphics"));
+      return Err(Malformed("target is empty or has a non-visible byte"));
     }
 
     let t_contents = str::from_utf8(target_raw)
@@ -25,7 +25,7 @@ impl Target {
       t if t.starts_with(b"/") => Target::Origin(t_contents),
       t if Target::is_absolute(t) => Target::Absolute(t_contents),
       t if Target::is_authority(t) => Target::Authority(t_contents),
-      _ => return Err(Malformed("Request does not match any target type")),
+      _ => return Err(Malformed("target matches no known form")),
     };
 
     Ok(target)

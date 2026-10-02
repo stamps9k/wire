@@ -10,10 +10,10 @@ pub struct Version {
 impl Version {
   pub fn parse(version_raw: &[u8]) -> Result<Version, RequestError> {
     let Some(rest) = version_raw.strip_prefix(b"HTTP/") else {
-      return Err(Malformed("Version missing the HTTP prefix"));
+      return Err(Malformed("version missing HTTP/ prefix"));
     };
     let [major @ b'0'..=b'9', b'.', minor @ b'0'..=b'9'] = rest else {
-      return Err(Malformed("Major minor versions not single digit numbers"));
+      return Err(Malformed("version is not digit.digit"));
     };
 
     let version = Version {
