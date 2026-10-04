@@ -1,6 +1,9 @@
 //! Per-connection handling: reads the request head and writes the response.
 
 use crate::request_error::RequestError;
+use crate::response;
+use crate::response::Response;
+use crate::status::Status;
 
 use std::io;
 use std::net::SocketAddr;
@@ -11,37 +14,56 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-use super::method::Method;
 use super::request::Request;
-use super::target::Target;
 
 /// Serves one client connection from start to finish.
 ///
-/// Reads the request head with a 10-second deadline, parses the request line
-/// and header fields, logs them, and sends the response. The connection is
-/// closed when this function returns, whichever path it takes.
+/// Calls `serve` to read the request and decide the response, writes that
+/// response, and closes the connection when this function returns.
 ///
-/// A client that does not send a complete head within the deadline is logged
-/// and dropped without a response, and that is not treated as an error.
+/// If the request fails, the error is mapped to a status with
+/// [`RequestError::status`] and an error page is sent. Errors with no status,
+/// where the client has gone or the socket is broken, send nothing.
 ///
 /// # Errors
 ///
-/// Returns [`RequestError::Closed`] or [`RequestError::TooLarge`] if the head
-/// cannot be read, [`RequestError::Malformed`] if the request line or a header
-/// field is invalid or the request fails validation, and [`RequestError::Io`]
-/// if reading from or writing to the socket fails. No response is sent in any
-/// of these cases.
+/// Returns the [`RequestError`] from reading, parsing or validating the
+/// request, after any error response has been written. Returns
+/// [`RequestError::Io`] if writing the response fails.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
 ) -> Result<(), RequestError> {
   println!("new client: {addr:?}");
 
-  let Ok(result) =
-    timeout(Duration::from_secs(10), read_head(&mut stream)).await
+  let result = serve(&mut stream).await;
+  let (response, outcome) = match result {
+    Ok(response) => (Some(response), Ok(())),
+    Err(e) => (e.status().map(Response::from_status), Err(e)),
+  };
+
+  if let Some(response) = response {
+    stream.write_all(&response.to_bytes()).await?;
+  }
+
+  outcome
+}
+
+/// Reads one request from `stream` and decides the response.
+///
+/// Reads the head with a 10-second deadline, parses and validates it, and
+/// returns a page that echoes the request. Nothing is written to the stream.
+///
+/// # Errors
+///
+/// Returns [`RequestError::RequestTimeout`] if the head is not complete
+/// within the deadline, [`RequestError::Closed`], [`RequestError::TooLarge`]
+/// or [`RequestError::Io`] if it cannot be read, and
+/// [`RequestError::Malformed`] if it fails parsing or validation.
+async fn serve(stream: &mut TcpStream) -> Result<Response, RequestError> {
+  let Ok(result) = timeout(Duration::from_secs(10), read_head(stream)).await
   else {
-    eprintln!("{addr}: header timeout");
-    return Ok(()); // timed out
+    return Err(RequestError::RequestTimeout);
   };
   let header = result?;
 
@@ -50,59 +72,10 @@ pub async fn handle(
   let request = Request::parse(&header)?;
   request.validate()?;
 
-  //TMP log to suppress unused error
-  match request.target {
-    Target::Origin(path) => println!("path is {path}"),
-    Target::Absolute(uri) => println!("absolute: {uri}"),
-    Target::Authority(host_port) => println!("connect to {host_port}"),
-    Target::Asterisk => println!("server-wide"),
-  }
-  if let Method::Other(s) = request.method {
-    println!("Non standard method: {s:?}");
-  }
-
-  //TMP log all headers
-  for h in &request.headers {
-    println!("{}: {}", h.name, h.value.escape_ascii());
-  }
-
-  let major: u8 = request.version.major;
-  let minor: u8 = request.version.minor;
-  println!("Major - {major :?}");
-  println!("Minor - {minor :?}");
-
-  // Send response
-  handle_request(&mut stream, header).await?;
-
-  Ok(())
-}
-
-/// Writes the HTTP response for a request to `stream`.
-///
-/// Currently always sends a fixed `200 OK` HTML page with `Connection: close`,
-/// whatever the request says. `_header` is the raw request head, which the
-/// parser and router will use later.
-///
-/// # Errors
-///
-/// Returns an error if writing to the socket fails.
-async fn handle_request(
-  stream: &mut TcpStream,
-  _header: Vec<u8>,
-) -> Result<(), RequestError> {
-  let body = "<!doctype html><title>wire</title><p>hello</p>";
-  let head = format!(
-    "HTTP/1.1 200 OK\r\n\
-     Content-Type: text/html; charset=utf-8\r\n\
-     Content-Length: {}\r\n\
-     Connection: close\r\n\
-     \r\n",
-    body.len()
-  );
-  stream.write_all(head.as_bytes()).await?;
-  stream.write_all(body.as_bytes()).await?;
-
-  Ok(())
+  Ok(Response {
+    status: Status::Ok,
+    body: response::echo_body(&request),
+  })
 }
 
 /// Reads the HTTP request head from `stream` until the blank line that ends it.

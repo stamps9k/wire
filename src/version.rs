@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::request_error::RequestError::Malformed;
 
 use super::request_error::RequestError;
@@ -22,6 +24,12 @@ impl Version {
     };
 
     Ok(version)
+  }
+}
+
+impl fmt::Display for Version {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "HTTP/{}.{}", self.major, self.minor)
   }
 }
 
@@ -106,5 +114,10 @@ mod tests {
   #[test]
   fn invalid_high_byte_digit() {
     assert!(Version::parse(b"HTTP/1.\xB1").is_err());
+  }
+
+  #[test]
+  fn display_version() {
+    assert_eq!(Version { major: 1, minor: 1 }.to_string(), "HTTP/1.1");
   }
 }

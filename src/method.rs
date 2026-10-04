@@ -1,4 +1,5 @@
 use super::grammar::is_token;
+use std::fmt;
 use std::str;
 
 use super::request_error::RequestError;
@@ -40,6 +41,23 @@ impl Method {
     };
 
     Ok(method)
+  }
+}
+
+impl fmt::Display for Method {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Get => "GET",
+      Self::Head => "HEAD",
+      Self::Post => "POST",
+      Self::Put => "PUT",
+      Self::Delete => "DELETE",
+      Self::Connect => "CONNECT",
+      Self::Options => "OPTIONS",
+      Self::Trace => "TRACE",
+      Self::Patch => "PATCH",
+      Self::Other(m) => m,
+    })
   }
 }
 
@@ -135,5 +153,15 @@ mod tests {
   #[test]
   fn rejects_lone_continuation_byte() {
     assert!(Method::parse(b"\x80GET").is_err());
+  }
+
+  #[test]
+  fn display_known_method() {
+    assert_eq!(Method::Get.to_string(), "GET");
+  }
+
+  #[test]
+  fn display_other_method_is_verbatim() {
+    assert_eq!(Method::Other("M-SEARCH".to_owned()).to_string(), "M-SEARCH");
   }
 }

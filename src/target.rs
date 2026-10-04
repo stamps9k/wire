@@ -1,3 +1,4 @@
+use std::fmt;
 use std::str;
 
 use crate::request_error::RequestError::{self, Malformed};
@@ -97,6 +98,15 @@ impl Target {
       | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
       | b'*' | b'+' | b',' | b';' | b'='
     )
+  }
+}
+
+impl fmt::Display for Target {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Origin(t) | Self::Absolute(t) | Self::Authority(t) => t,
+      Self::Asterisk => "*",
+    })
   }
 }
 
@@ -230,5 +240,15 @@ mod tests {
   #[test]
   fn invalid_empty_string() {
     assert!(Target::parse(b"").is_err());
+  }
+
+  #[test]
+  fn display_origin() {
+    assert_eq!(Target::Origin("/a?b=c".to_owned()).to_string(), "/a?b=c");
+  }
+
+  #[test]
+  fn display_asterisk() {
+    assert_eq!(Target::Asterisk.to_string(), "*");
   }
 }
