@@ -12,6 +12,7 @@ mod method;
 mod request;
 mod request_error;
 mod response;
+mod router;
 mod status;
 mod target;
 mod version;

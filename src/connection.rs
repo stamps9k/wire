@@ -1,9 +1,8 @@
 //! Per-connection handling: reads the request head and writes the response.
 
 use crate::request_error::RequestError;
-use crate::response;
 use crate::response::Response;
-use crate::status::Status;
+use crate::router;
 
 use std::io;
 use std::net::SocketAddr;
@@ -67,15 +66,10 @@ async fn serve(stream: &mut TcpStream) -> Result<Response, RequestError> {
   };
   let header = result?;
 
-  println!("Header is {:?}", String::from_utf8_lossy(&header));
-
   let request = Request::parse(&header)?;
   request.validate()?;
 
-  Ok(Response {
-    status: Status::Ok,
-    body: response::echo_body(&request),
-  })
+  Ok(router::route(&request))
 }
 
 /// Reads the HTTP request head from `stream` until the blank line that ends it.

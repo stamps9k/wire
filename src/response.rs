@@ -1,11 +1,16 @@
+use crate::header::Header;
 use crate::request::Request;
 use crate::status::Status;
 
 use std::fmt::Write as _;
 
-/// An HTTP response: a status and an HTML body.
+/// An HTTP response: a status, extra headers and an HTML body.
+///
+/// `headers` holds only the headers specific to this response, such as
+/// `Allow`. The fixed ones are written by [`Response::to_bytes`].
 pub struct Response {
   pub status: Status,
+  pub headers: Vec<Header>,
   pub body: Vec<u8>,
 }
 
@@ -14,6 +19,7 @@ impl Response {
   pub fn from_status(status: Status) -> Response {
     Response {
       status,
+      headers: Vec::new(),
       body: error_body(status),
     }
   }
@@ -21,14 +27,25 @@ impl Response {
   /// Serialises the response as it is sent on the wire.
   ///
   /// Writes the status line, the `Content-Type`, `Content-Length` and
-  /// `Connection: close` headers, a blank line, then the body.
-  /// `Content-Length` is the body's length in bytes.
+  /// `Connection: close` headers, then the extra headers in order, a blank
+  /// line, and the body. `Content-Length` is the body's length in bytes.
   pub fn to_bytes(&self) -> Vec<u8> {
+    let mut headers = String::new();
+    for header in &self.headers {
+      let _ = write!(
+        headers,
+        "{}: {}\r\n",
+        header.name,
+        String::from_utf8_lossy(&header.value)
+      );
+    }
+
     let mut response_text = format!(
       "HTTP/1.1 {} {}\r\n\
      Content-Type: text/html; charset=utf-8\r\n\
      Content-Length: {}\r\n\
      Connection: close\r\n\
+     {headers}\
      \r\n",
       self.status.code(),
       self.status.reason(),
@@ -61,18 +78,12 @@ pub fn echo_body(request: &Request) -> Vec<u8> {
     );
   }
 
-  format!(
-    "<!doctype html>\
-     <title>wire</title>\
-     <h1>wire</h1>\
-     <p>Method: {}</p>\
-     <p>Target: {}</p>\
-     <p>Version: {}</p>\
-     <h2>Headers</h2>\
-     <ul>{headers}</ul>",
-    request.method, request.target, request.version
-  )
-  .into_bytes()
+  include_str!("../public/index.html")
+    .replace("__METHOD__", &request.method.to_string())
+    .replace("__TARGET__", &request.target.to_string())
+    .replace("__VERSION__", &request.version.to_string())
+    .replace("__HEADERS__", headers.as_str())
+    .into_bytes()
 }
 
 /// Builds an HTML page showing the code and reason phrase of status.
@@ -131,6 +142,7 @@ mod tests {
   fn to_bytes_writes_head_then_body() {
     let response = Response {
       status: Status::Ok,
+      headers: Vec::new(),
       body: b"hello".to_vec(),
     };
     let bytes = response.to_bytes();
@@ -149,6 +161,7 @@ mod tests {
   fn to_bytes_counts_content_length_in_bytes() {
     let response = Response {
       status: Status::Ok,
+      headers: Vec::new(),
       body: "\u{e9}".as_bytes().to_vec(),
     };
     let bytes = response.to_bytes();
@@ -161,5 +174,49 @@ mod tests {
     let bytes = Response::from_status(Status::BadRequest).to_bytes();
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  }
+
+  #[test]
+  fn to_bytes_writes_extra_headers_before_the_blank_line() {
+    let response = Response {
+      status: Status::MethodNotAllowed,
+      headers: vec![Header {
+        name: "Allow".to_owned(),
+        value: b"GET".to_vec(),
+      }],
+      body: b"hi".to_vec(),
+    };
+    let bytes = response.to_bytes();
+    assert_eq!(
+      String::from_utf8_lossy(&bytes),
+      "HTTP/1.1 405 Method Not Allowed\r\n\
+       Content-Type: text/html; charset=utf-8\r\n\
+       Content-Length: 2\r\n\
+       Connection: close\r\n\
+       Allow: GET\r\n\
+       \r\n\
+       hi"
+    );
+  }
+
+  #[test]
+  fn to_bytes_writes_extra_headers_in_order() {
+    let response = Response {
+      status: Status::Ok,
+      headers: vec![
+        Header {
+          name: "X-First".to_owned(),
+          value: b"1".to_vec(),
+        },
+        Header {
+          name: "X-Second".to_owned(),
+          value: b"2".to_vec(),
+        },
+      ],
+      body: Vec::new(),
+    };
+    let bytes = response.to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\r\nX-First: 1\r\nX-Second: 2\r\n\r\n"));
   }
 }

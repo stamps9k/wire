@@ -5,6 +5,8 @@ pub enum Status {
   BadRequest,
   RequestTooLarge,
   RequestTimeout,
+  MethodNotAllowed,
+  NotFound,
 }
 
 impl Status {
@@ -15,6 +17,8 @@ impl Status {
       Self::BadRequest => 400,
       Self::RequestTooLarge => 431,
       Self::RequestTimeout => 408,
+      Self::MethodNotAllowed => 405,
+      Self::NotFound => 404,
     }
   }
 
@@ -25,6 +29,8 @@ impl Status {
       Self::BadRequest => "Bad Request",
       Self::RequestTooLarge => "Request Too Large",
       Self::RequestTimeout => "Request Timeout",
+      Self::MethodNotAllowed => "Method Not Allowed",
+      Self::NotFound => "Not Found",
     }
   }
 }
@@ -39,6 +45,8 @@ mod tests {
     assert_eq!(Status::BadRequest.code(), 400);
     assert_eq!(Status::RequestTimeout.code(), 408);
     assert_eq!(Status::RequestTooLarge.code(), 431);
+    assert_eq!(Status::NotFound.code(), 404);
+    assert_eq!(Status::MethodNotAllowed.code(), 405);
   }
 
   #[test]
@@ -47,5 +55,7 @@ mod tests {
     assert_eq!(Status::BadRequest.reason(), "Bad Request");
     assert_eq!(Status::RequestTimeout.reason(), "Request Timeout");
     assert_eq!(Status::RequestTooLarge.reason(), "Request Too Large");
+    assert_eq!(Status::NotFound.reason(), "Not Found");
+    assert_eq!(Status::MethodNotAllowed.reason(), "Method Not Allowed");
   }
 }
