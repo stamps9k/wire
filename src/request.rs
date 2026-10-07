@@ -1,5 +1,9 @@
 use crate::grammar::split_once;
+use crate::host_class;
+use crate::host_class::HostClass;
 use crate::request_error::RequestError::Malformed;
+
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::header::Header;
 use super::method::Method;
@@ -120,6 +124,47 @@ impl Request {
     }
 
     Ok(())
+  }
+
+  /// Classifies what the `Host` header names.
+  ///
+  /// The port, if any, is ignored. An IPv6 address must be in square
+  /// brackets, as the header requires. An IPv4 address or a name is taken
+  /// up to the first colon, and names are compared without regard to case.
+  ///
+  /// A value that is empty, is not valid UTF-8 or has an unclosed bracket
+  /// is [`HostClass::Other`]. [`HostClass::Absent`] means the header is
+  /// missing altogether.
+  pub fn classify_host_class(&self) -> HostClass {
+    let Some(host_header) = self.headers.iter().find(|h| h.name == "host")
+    else {
+      return HostClass::Absent;
+    };
+
+    let Ok(value) = std::str::from_utf8(host_header.value.as_slice()) else {
+      return HostClass::Other;
+    };
+
+    if let Some(rest) = value.strip_prefix('[') {
+      let Some((inner, _)) = rest.split_once(']') else {
+        return HostClass::Other;
+      };
+      return if inner.parse::<Ipv6Addr>().is_ok() {
+        HostClass::Ip
+      } else {
+        HostClass::Other
+      };
+    }
+
+    let host = value.split(':').next().unwrap_or(value);
+
+    if host.eq_ignore_ascii_case(host_class::HOSTNAME) {
+      HostClass::Own
+    } else if host.parse::<Ipv4Addr>().is_ok() {
+      HostClass::Ip
+    } else {
+      HostClass::Other
+    }
   }
 
   /// Checks that the target form fits the method (RFC 9112 section 3.2).
@@ -417,5 +462,141 @@ mod tests {
   #[test]
   fn other_method_with_origin_is_valid() {
     assert!(validated(b"PURGE / HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+  }
+
+  /// Classifies a request whose only header is `Host` with this value, or
+  /// returns `None` if the request does not parse.
+  fn host_class_of(host: &[u8]) -> Option<HostClass> {
+    let mut raw = b"GET / HTTP/1.1\r\nHost: ".to_vec();
+    raw.extend_from_slice(host);
+    raw.extend_from_slice(b"\r\n\r\n");
+    Request::parse(&raw).ok().map(|r| r.classify_host_class())
+  }
+
+  #[test]
+  fn host_class_absent_without_host_header() {
+    let request = Request::parse(b"GET / HTTP/1.0\r\nAccept: */*\r\n\r\n");
+    assert!(matches!(
+      request.ok().map(|r| r.classify_host_class()),
+      Some(HostClass::Absent)
+    ));
+  }
+
+  #[test]
+  fn host_class_own_for_server_name() {
+    assert!(matches!(
+      host_class_of(b"wire.stampatron.com"),
+      Some(HostClass::Own)
+    ));
+  }
+
+  #[test]
+  fn host_class_own_ignores_case_and_port() {
+    assert!(matches!(
+      host_class_of(b"WIRE.Stampatron.COM"),
+      Some(HostClass::Own)
+    ));
+    assert!(matches!(
+      host_class_of(b"wire.stampatron.com:8080"),
+      Some(HostClass::Own)
+    ));
+  }
+
+  #[test]
+  fn host_class_other_for_other_names() {
+    assert!(matches!(
+      host_class_of(b"example.com"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(
+      host_class_of(b"stampatron.com"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(
+      host_class_of(b"evil.wire.stampatron.com"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(
+      host_class_of(b"localhost:8080"),
+      Some(HostClass::Other)
+    ));
+  }
+
+  #[test]
+  fn host_class_ip_for_ipv4() {
+    assert!(matches!(host_class_of(b"127.0.0.1"), Some(HostClass::Ip)));
+    assert!(matches!(
+      host_class_of(b"203.0.113.9:80"),
+      Some(HostClass::Ip)
+    ));
+  }
+
+  #[test]
+  fn host_class_other_for_malformed_ipv4() {
+    assert!(matches!(
+      host_class_of(b"999.1.1.1"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(host_class_of(b"127.1"), Some(HostClass::Other)));
+    assert!(matches!(
+      host_class_of(b"0x7f.0.0.1"),
+      Some(HostClass::Other)
+    ));
+  }
+
+  #[test]
+  fn host_class_ip_for_bracketed_ipv6() {
+    assert!(matches!(host_class_of(b"[::1]"), Some(HostClass::Ip)));
+    assert!(matches!(host_class_of(b"[::1]:8080"), Some(HostClass::Ip)));
+    assert!(matches!(
+      host_class_of(b"[2001:db8::1]:443"),
+      Some(HostClass::Ip)
+    ));
+  }
+
+  #[test]
+  fn host_class_ip_for_full_length_ipv6_with_port() {
+    assert!(matches!(
+      host_class_of(b"[1:2:3:4:5:6:7:8]:80"),
+      Some(HostClass::Ip)
+    ));
+  }
+
+  #[test]
+  fn host_class_other_for_bad_brackets() {
+    assert!(matches!(host_class_of(b"[::1"), Some(HostClass::Other)));
+    assert!(matches!(host_class_of(b"[]"), Some(HostClass::Other)));
+    assert!(matches!(
+      host_class_of(b"[1.2.3.4]"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(
+      host_class_of(b"[wire.stampatron.com]"),
+      Some(HostClass::Other)
+    ));
+  }
+
+  #[test]
+  fn host_class_other_for_unbracketed_ipv6() {
+    assert!(matches!(host_class_of(b"::1"), Some(HostClass::Other)));
+    assert!(matches!(
+      host_class_of(b"2001:db8::1"),
+      Some(HostClass::Other)
+    ));
+  }
+
+  #[test]
+  fn host_class_other_for_empty_or_port_only_value() {
+    assert!(matches!(host_class_of(b""), Some(HostClass::Other)));
+    assert!(matches!(host_class_of(b":8080"), Some(HostClass::Other)));
+  }
+
+  #[test]
+  fn host_class_other_for_invalid_utf8() {
+    assert!(matches!(
+      host_class_of(b"caf\xe9.com"),
+      Some(HostClass::Other)
+    ));
+    assert!(matches!(host_class_of(b"\xff\xfe"), Some(HostClass::Other)));
   }
 }
