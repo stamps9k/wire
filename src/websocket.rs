@@ -1,5 +1,6 @@
-//! WebSocket opening handshake (RFC 6455 section 4.2): checks an upgrade
-//! request and builds the response that accepts or refuses it.
+//! WebSocket protocol (RFC 6455): the opening handshake, which checks an
+//! upgrade request and builds the response that accepts or refuses it, and
+//! the framing of messages the server sends.
 
 use crate::grammar;
 use crate::header::Header;
@@ -142,6 +143,36 @@ fn websocket_key(headers: &[Header]) -> Result<&[u8], Status> {
   }
 
   Ok(&header.value)
+}
+
+/// Wraps `payload` in a single WebSocket text frame, as sent by a server.
+///
+/// The first byte sets FIN and the text opcode, because each payload is a
+/// whole message. The length follows in the shortest form RFC 6455 allows:
+/// one byte up to 125, then `126` and a big-endian `u16` up to 65535, then
+/// `127` and a big-endian `u64`. Server frames are never masked, so the
+/// mask bit is clear and the payload is copied unchanged.
+///
+/// The caller must make sure the payload is valid UTF-8, because a text
+/// frame must hold UTF-8.
+pub fn text_frame(payload: &[u8]) -> Vec<u8> {
+  let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+  let mut out = Vec::with_capacity(payload.len().saturating_add(10));
+  out.push(0x81);
+
+  match (u8::try_from(len), u16::try_from(len)) {
+    (Ok(short), _) if short < 126 => out.push(short),
+    (_, Ok(medium)) => {
+      out.push(126);
+      out.extend_from_slice(&medium.to_be_bytes());
+    }
+    _ => {
+      out.push(127);
+      out.extend_from_slice(&len.to_be_bytes());
+    }
+  }
+  out.extend_from_slice(payload);
+  out
 }
 
 #[cfg(test)]
@@ -446,5 +477,100 @@ mod tests {
     let response = upgrade(&without("sec-websocket-key"));
     assert_eq!(response.status.code(), 400);
     assert!(value(&response, "sec-websocket-accept").is_none());
+  }
+
+  // ---- text_frame ----
+
+  #[test]
+  fn text_frame_of_an_empty_payload_is_two_bytes() {
+    assert_eq!(text_frame(b""), [0x81, 0x00]);
+  }
+
+  #[test]
+  fn text_frame_matches_the_rfc_hello_example() {
+    // RFC 6455 section 5.7: a single-frame unmasked text message.
+    assert_eq!(
+      text_frame(b"Hello"),
+      [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]
+    );
+  }
+
+  #[test]
+  fn text_frame_uses_one_length_byte_up_to_125() {
+    let payload = vec![b'a'; 125];
+    let frame = text_frame(&payload);
+    assert!(frame.starts_with(&[0x81, 125]));
+    assert_eq!(frame.len(), 127);
+    assert_eq!(frame.get(2..), Some(payload.as_slice()));
+  }
+
+  #[test]
+  fn text_frame_switches_to_two_length_bytes_at_126() {
+    let payload = vec![b'a'; 126];
+    let frame = text_frame(&payload);
+    assert!(frame.starts_with(&[0x81, 126, 0x00, 0x7e]));
+    assert_eq!(frame.len(), 130);
+    assert_eq!(frame.get(4..), Some(payload.as_slice()));
+  }
+
+  #[test]
+  fn text_frame_writes_the_two_byte_length_big_endian() {
+    // RFC 6455 section 5.7 gives 256 bytes as 0x7e 0x0100.
+    let frame = text_frame(&vec![b'a'; 256]);
+    assert!(frame.starts_with(&[0x81, 126, 0x01, 0x00]));
+    assert_eq!(frame.len(), 260);
+  }
+
+  #[test]
+  fn text_frame_uses_two_length_bytes_up_to_65535() {
+    let payload = vec![b'a'; 65_535];
+    let frame = text_frame(&payload);
+    assert!(frame.starts_with(&[0x81, 126, 0xff, 0xff]));
+    assert_eq!(frame.len(), 65_539);
+    assert_eq!(frame.get(4..), Some(payload.as_slice()));
+  }
+
+  #[test]
+  fn text_frame_switches_to_eight_length_bytes_at_65536() {
+    // RFC 6455 section 5.7 gives 64 KiB as 0x7f 0x0000000000010000.
+    let payload = vec![b'a'; 65_536];
+    let frame = text_frame(&payload);
+    assert!(frame.starts_with(&[0x81, 127, 0, 0, 0, 0, 0, 1, 0, 0]));
+    assert_eq!(frame.len(), 65_546);
+    assert_eq!(frame.get(10..), Some(payload.as_slice()));
+  }
+
+  #[test]
+  fn text_frame_never_sets_the_mask_bit() {
+    // A server must not mask the frames it sends.
+    for length in [0, 1, 125, 126, 127, 128, 255, 256, 65_535, 65_536] {
+      let frame = text_frame(&vec![0xff; length]);
+      assert_eq!(frame.get(1).map(|byte| byte & 0x80), Some(0), "{length}");
+    }
+  }
+
+  #[test]
+  fn text_frame_always_starts_with_fin_and_the_text_opcode() {
+    for length in [0, 1, 125, 126, 65_535, 65_536] {
+      let frame = text_frame(&vec![b'a'; length]);
+      assert_eq!(frame.first(), Some(&0x81), "{length}");
+    }
+  }
+
+  #[test]
+  fn text_frame_copies_the_payload_unchanged() {
+    // Bytes that look like frame headers must not be touched.
+    let payload = [0x81, 0x7e, 0x7f, 0x00, 0xff, b'\r', b'\n'];
+    let frame = text_frame(&payload);
+    assert_eq!(frame.get(..2), Some([0x81, 0x07].as_slice()));
+    assert_eq!(frame.get(2..), Some(payload.as_slice()));
+  }
+
+  #[test]
+  fn text_frame_counts_the_length_in_bytes() {
+    // Two characters, five bytes in UTF-8.
+    let frame = text_frame("é€".as_bytes());
+    assert_eq!(frame.get(1), Some(&5));
+    assert_eq!(frame.len(), 7);
   }
 }

@@ -22,6 +22,7 @@ mod status;
 mod target;
 mod tcp_snapshot;
 mod version;
+mod viewer;
 mod websocket;
 
 /// Binds to port 8080 on all interfaces and serves each accepted connection

@@ -1,5 +1,6 @@
-//! Per-connection handling: reads the request head, writes the response and
-//! publishes an event describing the connection.
+//! Per-connection handling: reads the request head, writes the response,
+//! publishes an event describing the connection, and hands a connection that
+//! upgraded to WebSocket over to [`viewer`].
 
 use crate::event;
 use crate::event::Event;
@@ -9,6 +10,7 @@ use crate::request_error::RequestError;
 use crate::response::Response;
 use crate::router;
 use crate::status::Status;
+use crate::viewer;
 
 use std::io;
 use std::net::SocketAddr;
@@ -26,8 +28,8 @@ use super::request::Request;
 
 /// Serves one client connection from start to finish.
 ///
-/// Calls `serve` to read the request and decide the response, writes that
-/// response, and closes the connection when this function returns.
+/// Calls `serve` to read the request and decide the response, then writes
+/// that response.
 ///
 /// If the request fails, the error is mapped to a status with
 /// [`RequestError::status`] and an error page is sent. Errors with no status,
@@ -37,11 +39,19 @@ use super::request::Request;
 /// whatever the outcome. `connection_id` is the number given to this
 /// connection when it was accepted.
 ///
+/// If the response was 101 Switching Protocols and was written successfully,
+/// the connection becomes a viewer. It subscribes to `tx` before its own
+/// event is sent, so that event is the first one it receives. Then
+/// [`viewer::stream_events`] keeps the connection open and streams every
+/// event to the client until the client goes away. Any other connection is
+/// closed when this function returns.
+///
 /// # Errors
 ///
 /// Returns the [`RequestError`] from reading, parsing or validating the
 /// request, after any error response has been written. Returns
-/// [`RequestError::Io`] if writing the response fails.
+/// [`RequestError::Io`] if writing the response fails, or if a write to a
+/// viewer fails, which is how a viewer leaving is noticed.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
@@ -64,6 +74,14 @@ pub async fn handle(
     None => Ok(()),
   };
 
+  let upgraded = written.is_ok()
+    && matches!(
+      &result,
+      Ok((_, response))
+        if matches!(response.status, Status::SwitchingProtocols)
+    );
+  let viewer = upgraded.then(|| tx.subscribe());
+
   publish_event(
     connection_id,
     addr,
@@ -75,6 +93,11 @@ pub async fn handle(
   );
 
   written?;
+
+  if let Some(rx) = viewer {
+    viewer::stream_events(&mut stream, rx).await?;
+  }
+
   result.map(|_| ())
 }
 
@@ -241,4 +264,195 @@ async fn read_head(
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  use std::error::Error;
+
+  use serde_json::Value;
+  use tokio::net::TcpListener;
+  use tokio::sync::broadcast;
+
+  type TestResult = Result<(), Box<dyn Error>>;
+
+  const UPGRADE: &[u8] = b"GET /ws HTTP/1.1\r\n\
+    Host: wire.stampatron.com\r\n\
+    Upgrade: websocket\r\n\
+    Connection: Upgrade\r\n\
+    Sec-WebSocket-Version: 13\r\n\
+    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+    \r\n";
+
+  /// Starts `handle` on one loopback connection, as connection 1, and
+  /// returns the client's end of it.
+  async fn connect(tx: Sender<Event>) -> io::Result<TcpStream> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    tokio::spawn(async move {
+      if let Ok((stream, peer)) = listener.accept().await {
+        let _ = handle(stream, peer, tx, 1).await;
+      }
+    });
+    TcpStream::connect(address).await
+  }
+
+  /// Reads up to and including the blank line that ends a response head,
+  /// one byte at a time so that nothing after it is consumed.
+  async fn read_response_head(client: &mut TcpStream) -> io::Result<String> {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+      head.push(client.read_u8().await?);
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+  }
+
+  /// Reads one unmasked text frame and parses its payload as JSON.
+  async fn read_event(client: &mut TcpStream) -> Result<Value, Box<dyn Error>> {
+    if client.read_u8().await? != 0x81 {
+      return Err("not a final text frame".into());
+    }
+    let length = match client.read_u8().await? {
+      126 => usize::from(client.read_u16().await?),
+      short if short < 126 => usize::from(short),
+      _ => return Err("frame is masked or too long for this test".into()),
+    };
+    let mut payload = vec![0; length];
+    client.read_exact(&mut payload).await?;
+    Ok(serde_json::from_slice(&payload)?)
+  }
+
+  /// Waits until `handle` has subscribed to the channel.
+  async fn subscribed(tx: &Sender<Event>) -> Result<(), Box<dyn Error>> {
+    for _ in 0..500 {
+      if tx.receiver_count() > 0 {
+        return Ok(());
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the connection never subscribed to the channel".into())
+  }
+
+  fn event(connection_id: u64) -> Event {
+    Event {
+      connection_id,
+      peer_address: SocketAddr::from(([203, 0, 113, 9], 51_234)),
+      timestamp_ms: 1_700_000_000_000,
+      duration_ms: 12,
+      bytes_received: 78,
+      tcp_snapshot: None,
+      kind: Kind::Rejected {
+        reason: RejectReason::Closed,
+        detail: None,
+        status: None,
+      },
+    }
+  }
+
+  fn id(event: &Value) -> Option<u64> {
+    event.get("connection_id").and_then(Value::as_u64)
+  }
+
+  #[tokio::test]
+  async fn a_plain_request_is_answered_and_the_connection_closed() -> TestResult
+  {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx).await?;
+    client
+      .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .await?;
+
+    // Reading to the end only returns once the server has closed.
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_refused_handshake_is_answered_and_the_connection_closed()
+  -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx).await?;
+    client
+      .write_all(b"GET /ws HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .await?;
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+
+    assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn an_upgraded_connection_is_sent_later_events_as_frames() -> TestResult
+  {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx.clone()).await?;
+    client.write_all(UPGRADE).await?;
+
+    let head = timeout(Duration::from_secs(5), read_response_head(&mut client))
+      .await??;
+    assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+    let _ = tx.send(event(41));
+    let _ = tx.send(event(42));
+
+    // The connection's own handshake event (id 1) may or may not come
+    // first, depending on when `handle` subscribes. Skip it if it does.
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+      let event =
+        timeout(Duration::from_secs(5), read_event(&mut client)).await??;
+      if id(&event) != Some(1) {
+        seen.push(id(&event));
+      }
+    }
+    assert_eq!(seen, [Some(41), Some(42)]);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn an_upgraded_connection_publishes_its_handshake_as_a_request()
+  -> TestResult {
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx).await?;
+    client.write_all(UPGRADE).await?;
+
+    let event = timeout(Duration::from_secs(5), rx.recv()).await??;
+
+    assert_eq!(event.connection_id, 1);
+    assert!(matches!(event.kind, Kind::Request { status: 101, .. }));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn an_upgraded_connection_stops_when_the_client_has_gone() -> TestResult
+  {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx.clone()).await?;
+    client.write_all(UPGRADE).await?;
+    timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
+    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+
+    drop(client);
+
+    // The server only notices on a write, and the first write after the
+    // client closes can still succeed, so keep sending until it lets go.
+    for connection_id in 100..600 {
+      if tx.receiver_count() == 0 {
+        return Ok(());
+      }
+      let _ = tx.send(event(connection_id));
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the connection was still subscribed after the client left".into())
+  }
 }
