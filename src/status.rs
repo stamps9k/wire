@@ -7,12 +7,14 @@ pub enum Status {
   RequestTimeout,
   MethodNotAllowed,
   NotFound,
+  SwitchingProtocols,
 }
 
 impl Status {
   /// Returns the numeric status code, such as 200 or 400.
   pub fn code(self) -> u16 {
     match self {
+      Self::SwitchingProtocols => 101,
       Self::Ok => 200,
       Self::BadRequest => 400,
       Self::RequestTooLarge => 431,
@@ -25,6 +27,7 @@ impl Status {
   /// Returns the reason phrase that follows the code on the status line.
   pub fn reason(self) -> &'static str {
     match self {
+      Self::SwitchingProtocols => "Switching Protocols",
       Self::Ok => "OK",
       Self::BadRequest => "Bad Request",
       Self::RequestTooLarge => "Request Too Large",
@@ -41,6 +44,7 @@ mod tests {
 
   #[test]
   fn codes_are_correct() {
+    assert_eq!(Status::SwitchingProtocols.code(), 101);
     assert_eq!(Status::Ok.code(), 200);
     assert_eq!(Status::BadRequest.code(), 400);
     assert_eq!(Status::RequestTimeout.code(), 408);
@@ -51,6 +55,7 @@ mod tests {
 
   #[test]
   fn reasons_are_correct() {
+    assert_eq!(Status::SwitchingProtocols.reason(), "Switching Protocols");
     assert_eq!(Status::Ok.reason(), "OK");
     assert_eq!(Status::BadRequest.reason(), "Bad Request");
     assert_eq!(Status::RequestTimeout.reason(), "Request Timeout");

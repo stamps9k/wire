@@ -29,6 +29,10 @@ impl Response {
   /// Writes the status line, the `Content-Type`, `Content-Length` and
   /// `Connection: close` headers, then the extra headers in order, a blank
   /// line, and the body. `Content-Length` is the body's length in bytes.
+  ///
+  /// A 101 response is the exception: it gets only the status line, the
+  /// extra headers and the blank line. The fixed headers and the body are
+  /// left out, because the bytes that follow belong to the new protocol.
   pub fn to_bytes(&self) -> Vec<u8> {
     let mut headers = String::new();
     for header in &self.headers {
@@ -40,20 +44,31 @@ impl Response {
       );
     }
 
-    let mut response_text = format!(
-      "HTTP/1.1 {} {}\r\n\
-     Content-Type: text/html; charset=utf-8\r\n\
-     Content-Length: {}\r\n\
-     Connection: close\r\n\
-     {headers}\
-     \r\n",
-      self.status.code(),
-      self.status.reason(),
-      self.body.len()
-    )
-    .into_bytes();
-    response_text.extend_from_slice(&self.body);
-    response_text
+    if matches!(self.status, Status::SwitchingProtocols) {
+      format!(
+        "HTTP/1.1 {} {}\r\n\
+          {headers}\
+          \r\n",
+        self.status.code(),
+        self.status.reason(),
+      )
+      .into_bytes()
+    } else {
+      let mut s = format!(
+        "HTTP/1.1 {} {}\r\n\
+        Content-Type: text/html; charset=utf-8\r\n\
+        Content-Length: {}\r\n\
+        Connection: close\r\n\
+        {headers}\
+        \r\n",
+        self.status.code(),
+        self.status.reason(),
+        self.body.len()
+      )
+      .into_bytes();
+      s.extend_from_slice(&self.body);
+      s
+    }
   }
 }
 
@@ -218,5 +233,45 @@ mod tests {
     let bytes = response.to_bytes();
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("\r\nX-First: 1\r\nX-Second: 2\r\n\r\n"));
+  }
+
+  #[test]
+  fn to_bytes_writes_only_extra_headers_for_switching_protocols() {
+    let response = Response {
+      status: Status::SwitchingProtocols,
+      headers: vec![
+        Header {
+          name: "Upgrade".to_owned(),
+          value: b"websocket".to_vec(),
+        },
+        Header {
+          name: "Connection".to_owned(),
+          value: b"Upgrade".to_vec(),
+        },
+      ],
+      body: Vec::new(),
+    };
+    let bytes = response.to_bytes();
+    assert_eq!(
+      String::from_utf8_lossy(&bytes),
+      "HTTP/1.1 101 Switching Protocols\r\n\
+       Upgrade: websocket\r\n\
+       Connection: Upgrade\r\n\
+       \r\n"
+    );
+  }
+
+  #[test]
+  fn to_bytes_writes_no_body_for_switching_protocols() {
+    let response = Response {
+      status: Status::SwitchingProtocols,
+      headers: Vec::new(),
+      body: b"hello".to_vec(),
+    };
+    let bytes = response.to_bytes();
+    assert_eq!(
+      String::from_utf8_lossy(&bytes),
+      "HTTP/1.1 101 Switching Protocols\r\n\r\n"
+    );
   }
 }

@@ -2,16 +2,17 @@
 use crate::header::Header;
 use crate::method::Method;
 use crate::request::Request;
-use crate::response;
 use crate::response::Response;
 use crate::status::Status;
 use crate::target::Target;
+use crate::{response, websocket};
 
 /// Chooses the response for `request`.
 ///
 /// The method is checked first, then the path. Any method other than `GET`
 /// gets 405. A `GET` for `/`, with or without a query, gets the index page.
-/// Everything else gets 404, including targets that are not in origin form.
+/// A `GET` for `/ws` is answered by [`websocket::upgrade`]. Everything else
+/// gets 404, including targets that are not in origin form.
 ///
 /// The request must already have passed [`Request::validate`]. This function
 /// reads nothing from the connection and cannot fail.
@@ -31,8 +32,10 @@ pub fn route(request: &Request) -> Response {
 
   let resource = target.split('?').next();
 
-  if resource != Some("/") {
-    return Response::from_status(Status::NotFound);
+  match resource {
+    Some("/") => {}
+    Some("/ws") => return websocket::upgrade(request),
+    Some(_) | None => return Response::from_status(Status::NotFound),
   }
 
   Response {
@@ -141,5 +144,14 @@ mod tests {
     let missing = route(&request(Method::Get, origin("/nope")));
     assert!(found.headers.is_empty());
     assert!(missing.headers.is_empty());
+  }
+
+  #[test]
+  fn get_ws_is_handed_to_the_websocket_handshake() {
+    // No upgrade headers, so the handshake refuses it. A 404 here would
+    // mean the path was never routed.
+    assert_eq!(code(Method::Get, origin("/ws")), 400);
+    assert_eq!(code(Method::Get, origin("/ws?a=b")), 400);
+    assert_eq!(code(Method::Post, origin("/ws")), 405);
   }
 }
