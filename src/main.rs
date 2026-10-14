@@ -10,6 +10,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 mod connection;
 mod event;
+mod frame;
 mod grammar;
 mod header;
 mod host_class;

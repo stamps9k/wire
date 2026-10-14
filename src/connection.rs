@@ -50,8 +50,8 @@ use super::request::Request;
 ///
 /// Returns the [`RequestError`] from reading, parsing or validating the
 /// request, after any error response has been written. Returns
-/// [`RequestError::Io`] if writing the response fails, or if a write to a
-/// viewer fails, which is how a viewer leaving is noticed.
+/// [`RequestError::Io`] if writing the response fails, or if reading from or
+/// writing to a viewer fails.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
