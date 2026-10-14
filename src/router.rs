@@ -1,11 +1,12 @@
 //! Routing: decides the response for a valid request.
 use crate::header::Header;
 use crate::method::Method;
+use crate::pages;
 use crate::request::Request;
 use crate::response::Response;
 use crate::status::Status;
 use crate::target::Target;
-use crate::{response, websocket};
+use crate::websocket;
 
 /// Chooses the response for `request`.
 ///
@@ -33,15 +34,9 @@ pub fn route(request: &Request) -> Response {
   let resource = target.split('?').next();
 
   match resource {
-    Some("/") => {}
-    Some("/ws") => return websocket::upgrade(request),
-    Some(_) | None => return Response::from_status(Status::NotFound),
-  }
-
-  Response {
-    status: Status::Ok,
-    headers: Vec::new(),
-    body: response::echo_body(request),
+    Some("/") => Response::ok(pages::index(request)),
+    Some("/ws") => websocket::upgrade(request),
+    Some(_) | None => Response::from_status(Status::NotFound),
   }
 }
 

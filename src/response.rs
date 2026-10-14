@@ -1,5 +1,11 @@
+//! Responses: the message sent back to the client and its wire format.
+//!
+//! A [`Response`] holds a status, any extra headers and a body.
+//! [`Response::to_bytes`] adds the fixed headers and serialises it. Page
+//! bodies come from [`pages`](crate::pages).
+
 use crate::header::Header;
-use crate::request::Request;
+use crate::pages;
 use crate::status::Status;
 
 use std::fmt::Write as _;
@@ -20,7 +26,7 @@ impl Response {
     Response {
       status,
       headers: Vec::new(),
-      body: error_body(status),
+      body: pages::error(status),
     }
   }
 
@@ -70,72 +76,27 @@ impl Response {
       s
     }
   }
-}
 
-/// Builds an HTML page that echoes the request head back to the client.
-///
-/// The method, target and version are inserted exactly as they were parsed,
-/// followed by the header fields in the order they were received. Header
-/// values are raw bytes, so any that are not valid UTF-8 are shown with
-/// replacement characters.
-//
-// TODO: escape the values for HTML before this is reachable from the public
-// address. The target, method and header fields are client-controlled.
-pub fn echo_body(request: &Request) -> Vec<u8> {
-  let mut headers = String::new();
-  for header in &request.headers {
-    // Writing to a `String` cannot fail, so the result is discarded.
-    let _ = write!(
-      headers,
-      "<li>{}: {}</li>",
-      header.name,
-      String::from_utf8_lossy(&header.value)
-    );
+  /// Builds a 200 response with `body` and no extra headers.
+  pub fn ok(body: Vec<u8>) -> Response {
+    Response {
+      status: Status::Ok,
+      headers: Vec::new(),
+      body,
+    }
   }
-
-  include_str!("../public/index.html")
-    .replace("__METHOD__", &request.method.to_string())
-    .replace("__TARGET__", &request.target.to_string())
-    .replace("__VERSION__", &request.version.to_string())
-    .replace("__HEADERS__", headers.as_str())
-    .into_bytes()
-}
-
-/// Builds an HTML page showing the code and reason phrase of status.
-pub fn error_body(status: Status) -> Vec<u8> {
-  format!(
-    "<!doctype html>\
-     <title>wire</title>\
-     <h1>wire</h1>\
-     <p>Error Code: {}</p>\
-     <p>Reason: {}</p>",
-    status.code(),
-    status.reason()
-  )
-  .into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::method::Method;
-  use crate::target::Target;
-  use crate::version::Version;
 
   #[test]
-  fn echo_body_contains_request_line_parts() {
-    let request = Request {
-      method: Method::Get,
-      target: Target::Origin("/a?b=c".to_owned()),
-      version: Version { major: 1, minor: 1 },
-      headers: Vec::new(),
-    };
-    let body = echo_body(&request);
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.starts_with("<!doctype html>"));
-    assert!(body.contains("<p>Method: GET</p>"));
-    assert!(body.contains("<p>Target: /a?b=c</p>"));
-    assert!(body.contains("<p>Version: HTTP/1.1</p>"));
+  fn ok_is_200_with_the_body_and_no_extra_headers() {
+    let response = Response::ok(b"hello".to_vec());
+    assert!(matches!(response.status, Status::Ok));
+    assert!(response.headers.is_empty());
+    assert_eq!(response.body, b"hello");
   }
 
   #[test]

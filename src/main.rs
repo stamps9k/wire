@@ -15,6 +15,7 @@ mod grammar;
 mod header;
 mod host_class;
 mod method;
+mod pages;
 mod request;
 mod request_error;
 mod response;
