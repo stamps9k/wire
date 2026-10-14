@@ -11,9 +11,10 @@ use crate::websocket;
 /// Chooses the response for `request`.
 ///
 /// The method is checked first, then the path. Any method other than `GET`
-/// gets 405. A `GET` for `/`, with or without a query, gets the index page.
-/// A `GET` for `/ws` is answered by [`websocket::upgrade`]. Everything else
-/// gets 404, including targets that are not in origin form.
+/// gets 405. A `GET` for `/` gets the index page and a `GET` for `/debug`
+/// the debug page, with or without a query. A `GET` for `/ws` is answered
+/// by [`websocket::upgrade`]. Everything else gets 404, including targets
+/// that are not in origin form.
 ///
 /// The request must already have passed [`Request::validate`]. This function
 /// reads nothing from the connection and cannot fail.
@@ -35,6 +36,7 @@ pub fn route(request: &Request) -> Response {
 
   match resource {
     Some("/") => Response::ok(pages::index(request)),
+    Some("/debug") => Response::ok(pages::debug()),
     Some("/ws") => websocket::upgrade(request),
     Some(_) | None => Response::from_status(Status::NotFound),
   }
@@ -148,5 +150,32 @@ mod tests {
     assert_eq!(code(Method::Get, origin("/ws")), 400);
     assert_eq!(code(Method::Get, origin("/ws?a=b")), 400);
     assert_eq!(code(Method::Post, origin("/ws")), 405);
+  }
+
+  #[test]
+  fn get_debug_serves_the_debug_page() {
+    let response = route(&request(Method::Get, origin("/debug")));
+    assert_eq!(response.status.code(), 200);
+    assert!(response.headers.is_empty());
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("<title>wire debug</title>"));
+  }
+
+  #[test]
+  fn get_debug_ignores_the_query() {
+    assert_eq!(code(Method::Get, origin("/debug?a=b")), 200);
+    assert_eq!(code(Method::Get, origin("/debug?")), 200);
+  }
+
+  #[test]
+  fn debug_path_must_match_exactly() {
+    assert_eq!(code(Method::Get, origin("/debug/")), 404);
+    assert_eq!(code(Method::Get, origin("/debugx")), 404);
+    assert_eq!(code(Method::Get, origin("/Debug")), 404);
+  }
+
+  #[test]
+  fn other_methods_on_debug_are_not_allowed() {
+    assert_eq!(code(Method::Post, origin("/debug")), 405);
   }
 }

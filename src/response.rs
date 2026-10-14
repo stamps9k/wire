@@ -2,7 +2,7 @@
 //!
 //! A [`Response`] holds a status, any extra headers and a body.
 //! [`Response::to_bytes`] adds the fixed headers and serialises it. Page
-//! bodies come from [`pages`](crate::pages).
+//! bodies come from [`pages`].
 
 use crate::header::Header;
 use crate::pages;

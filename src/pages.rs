@@ -1,7 +1,8 @@
 //! HTML bodies for the pages wire serves.
 //!
 //! Each function returns only a body. The status and headers are chosen by
-//! the router or by [`Response::from_status`](crate::response::Response::from_status).
+//! the router or by
+//! [`Response::from_status`](crate::response::Response::from_status).
 
 use std::fmt::Write as _;
 
@@ -35,6 +36,13 @@ pub fn index(request: &Request) -> Vec<u8> {
     .replace("__VERSION__", &request.version.to_string())
     .replace("__HEADERS__", headers.as_str())
     .into_bytes()
+}
+
+/// Returns the debug page, which shows the event stream from `/ws` as text.
+///
+/// The page is static: it does not depend on the request.
+pub fn debug() -> Vec<u8> {
+  include_str!("../public/debug.html").as_bytes().to_vec()
 }
 
 /// Builds an HTML page showing the code and reason phrase of `status`.
@@ -81,6 +89,20 @@ mod tests {
 
   fn error_text(status: Status) -> String {
     String::from_utf8_lossy(&error(status)).into_owned()
+  }
+
+  #[test]
+  fn debug_is_the_debug_page() {
+    let body = String::from_utf8_lossy(&debug()).into_owned();
+    assert!(body.starts_with("<!doctype html>"));
+    assert!(body.contains("<title>wire debug</title>"));
+    assert!(body.contains("/ws"));
+  }
+
+  #[test]
+  fn debug_has_no_placeholders() {
+    let body = String::from_utf8_lossy(&debug()).into_owned();
+    assert!(!body.contains("__"));
   }
 
   #[test]
