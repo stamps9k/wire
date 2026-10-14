@@ -1,8 +1,8 @@
-use super::grammar::is_token;
 use std::fmt;
 use std::str;
 
-use super::request_error::RequestError;
+use crate::http::RequestError;
+use crate::http::grammar::is_token;
 
 pub enum Method {
   Get,

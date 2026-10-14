@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str;
 
-use crate::request_error::RequestError::{self, Malformed};
+use crate::http::RequestError::{self, Malformed};
 
 pub enum Target {
   Origin(String),    // "/search?q=foo"
@@ -12,7 +12,7 @@ pub enum Target {
 
 impl Target {
   pub fn parse(target_raw: &[u8]) -> Result<Target, RequestError> {
-    //First reject empty strings and non ascii characters
+    // First reject empty strings and non ascii characters
     if target_raw.is_empty() || !target_raw.iter().all(u8::is_ascii_graphic) {
       return Err(Malformed("target is empty or has a non-visible byte"));
     }
@@ -51,7 +51,7 @@ impl Target {
   }
 
   fn is_scheme(s: &[u8]) -> bool {
-    /* first is a letter, every byte in rest is allowed */
+    // First is a letter, every byte in rest is allowed
     match s {
       [b'a'..=b'z' | b'A'..=b'Z', rest @ ..] => rest
         .iter()

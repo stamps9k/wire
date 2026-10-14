@@ -1,8 +1,7 @@
 use std::fmt;
 
-use crate::request_error::RequestError::Malformed;
-
-use super::request_error::RequestError;
+use crate::http::RequestError;
+use crate::http::RequestError::Malformed;
 
 pub struct Version {
   pub major: u8,

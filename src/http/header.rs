@@ -1,8 +1,8 @@
-use crate::grammar::{is_field_value, is_token, split_once, trim_ows};
-use crate::request_error::RequestError;
-use crate::request_error::RequestError::Malformed;
-
 use std::str;
+
+use crate::http::RequestError;
+use crate::http::RequestError::Malformed;
+use crate::http::grammar::{is_field_value, is_token, split_once, trim_ows};
 
 /// One header field from a request.
 ///
@@ -41,6 +41,18 @@ impl Header {
         .to_ascii_lowercase(),
       value: trim_ows(value_raw).to_vec(),
     })
+  }
+
+  /// Reports whether this field's value lists `token`.
+  ///
+  /// The value is read as a comma-separated list (RFC 9110 section 5.6.1).
+  /// Whitespace around an element is ignored and the comparison ignores
+  /// case.
+  pub fn has_token(&self, token: &[u8]) -> bool {
+    self
+      .value
+      .split(|&b| b == b',')
+      .any(|element| trim_ows(element).eq_ignore_ascii_case(token))
   }
 }
 
@@ -181,5 +193,79 @@ mod tests {
   #[test]
   fn rejects_del_in_value() {
     assert!(Header::parse(b"X: a\x7Fb").is_err());
+  }
+
+  /// Reports whether a `Connection` header with this value lists `token`.
+  fn lists(value: &[u8], token: &[u8]) -> bool {
+    let header = Header {
+      name: "connection".to_owned(),
+      value: value.to_vec(),
+    };
+    header.has_token(token)
+  }
+
+  #[test]
+  fn has_token_finds_a_single_token() {
+    assert!(lists(b"upgrade", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_finds_a_token_anywhere_in_a_list() {
+    assert!(lists(b"upgrade, keep-alive", b"upgrade"));
+    assert!(lists(b"keep-alive, upgrade", b"upgrade"));
+    assert!(lists(b"a, upgrade, b", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_ignores_case() {
+    assert!(lists(b"Upgrade", b"upgrade"));
+    assert!(lists(b"UPGRADE", b"upgrade"));
+    assert!(lists(b"upgrade", b"UpGrAdE"));
+  }
+
+  #[test]
+  fn has_token_ignores_whitespace_around_elements() {
+    assert!(lists(b"keep-alive ,upgrade", b"upgrade"));
+    assert!(lists(b"keep-alive,  upgrade  ", b"upgrade"));
+    assert!(lists(b"keep-alive,\tupgrade", b"upgrade"));
+    assert!(lists(b"keep-alive, \t upgrade \t", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_tolerates_empty_elements() {
+    assert!(lists(b",upgrade", b"upgrade"));
+    assert!(lists(b"upgrade,", b"upgrade"));
+    assert!(lists(b"keep-alive, , upgrade", b"upgrade"));
+    assert!(lists(b",,upgrade,,", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_needs_a_whole_element() {
+    assert!(!lists(b"upgrades", b"upgrade"));
+    assert!(!lists(b"no-upgrade", b"upgrade"));
+    assert!(!lists(b"upgrade-later", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_keeps_inner_whitespace() {
+    assert!(!lists(b"up grade", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_rejects_an_absent_token() {
+    assert!(!lists(b"keep-alive", b"upgrade"));
+    assert!(!lists(b"keep-alive, close", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_rejects_an_empty_value() {
+    assert!(!lists(b"", b"upgrade"));
+    assert!(!lists(b" , ,", b"upgrade"));
+  }
+
+  #[test]
+  fn has_token_handles_bytes_that_are_not_utf8() {
+    assert!(lists(b"caf\xE9, upgrade", b"upgrade"));
+    assert!(!lists(b"upgrad\xE9", b"upgrade"));
   }
 }

@@ -1,19 +1,28 @@
-//! Events: one record per connection, broadcast to every subscriber.
-//!
-//! An [`Event`] holds what all connections have in common, and its [`Kind`]
-//! holds what depends on how the connection ended. Events are built once,
-//! cloned to each subscriber and serialised to JSON for the browser.
+//! The [`Event`] record, and the truncation that caps text taken from the
+//! client before it goes into one.
 
 use std::net::SocketAddr;
 
 use serde::Serialize;
 
-use crate::host_class::HostClass;
-use crate::tcp_snapshot::TcpSnapshot;
+use crate::event::Kind;
+use crate::event::TcpSnapshot;
 
 /// Longest text, in bytes, that an event carries for any one field taken
 /// from the client.
 pub const CAP_SIZE: usize = 128;
+
+/// Cuts `s` to at most `max_length` bytes.
+///
+/// The cut is moved back to the nearest character boundary, so the result
+/// is always valid UTF-8 and may be slightly shorter than `max_length`.
+/// Text already within the limit is returned unchanged.
+pub fn truncate(mut s: String, max_length: usize) -> String {
+  let end = (0..=max_length).rev().find(|&i| s.is_char_boundary(i));
+
+  s.truncate(end.unwrap_or_default());
+  s
+}
 
 /// What happened on one client connection.
 ///
@@ -46,83 +55,11 @@ pub struct Event {
   pub kind: Kind,
 }
 
-/// How a connection ended.
-///
-/// Serialised with the variant name as a `kind` field, in snake case, next
-/// to the variant's own fields.
-#[derive(Clone, Serialize)]
-#[serde(tag = "kind")]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-  /// A request was parsed and validated, and a response was chosen for it.
-  Request {
-    /// The request method as text, such as `GET`. Truncated.
-    method: String,
-    /// The request target as text, such as `/index.html`. Truncated.
-    target: String,
-    /// Length of the target in bytes before it was truncated.
-    target_length: u32,
-    /// The HTTP version as text.
-    version: String,
-    /// Status code of the response.
-    status: u16,
-    /// Value of the `User-Agent` header, converted lossily to UTF-8 and
-    /// truncated. `None` if the header is absent.
-    user_agent: Option<String>,
-    /// Length of the `User-Agent` value in bytes before it was truncated,
-    /// or 0 if the header is absent.
-    user_agent_length: u32,
-    /// What the `Host` header named.
-    host_class: HostClass,
-    /// Number of header fields in the request.
-    header_count: u16,
-  },
-  /// No valid request was obtained from the client.
-  Rejected {
-    /// Why the request was rejected.
-    reason: RejectReason,
-    /// Which part of the request was at fault. Only set when `reason` is
-    /// [`RejectReason::Malformed`].
-    detail: Option<&'static str>,
-    /// Status code of the error response, or `None` if nothing was sent.
-    status: Option<u16>,
-  },
-}
-
-/// Cuts `s` to at most `max_length` bytes.
-///
-/// The cut is moved back to the nearest character boundary, so the result
-/// is always valid UTF-8 and may be slightly shorter than `max_length`.
-/// Text already within the limit is returned unchanged.
-pub fn truncate(mut s: String, max_length: usize) -> String {
-  let end = (0..=max_length).rev().find(|&i| s.is_char_boundary(i));
-
-  s.truncate(end.unwrap_or_default());
-  s
-}
-
-/// Why no valid request was obtained from a connection.
-///
-/// Mirrors the variants of `RequestError` without their data, so that it
-/// can be cloned and serialised. Written to JSON in snake case.
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RejectReason {
-  /// The client closed the connection before the request head was complete.
-  Closed,
-  /// Reading from or writing to the socket failed.
-  Io,
-  /// The request head exceeded the size limit.
-  TooLarge,
-  /// The request failed parsing or validation.
-  Malformed,
-  /// The request head was not complete within the deadline.
-  Timeout,
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::event::RejectReason;
+  use crate::http::HostClass;
 
   fn assert_broadcastable<T: Clone + Send + 'static>() {}
 
@@ -274,17 +211,6 @@ mod tests {
     event.peer_address = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080));
     let json = serde_json::to_string(&event)?;
     assert!(json.contains(r#""peer_address":"[::1]:8080","#));
-    Ok(())
-  }
-
-  #[test]
-  fn reject_reasons_are_snake_case() -> Result<(), serde_json::Error> {
-    let json = |reason: RejectReason| serde_json::to_string(&reason);
-    assert_eq!(json(RejectReason::Closed)?, r#""closed""#);
-    assert_eq!(json(RejectReason::Io)?, r#""io""#);
-    assert_eq!(json(RejectReason::TooLarge)?, r#""too_large""#);
-    assert_eq!(json(RejectReason::Malformed)?, r#""malformed""#);
-    assert_eq!(json(RejectReason::Timeout)?, r#""timeout""#);
     Ok(())
   }
 

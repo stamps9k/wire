@@ -1,15 +1,14 @@
-use crate::grammar::split_once;
-use crate::host_class;
-use crate::host_class::HostClass;
-use crate::request_error::RequestError::Malformed;
-
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use super::header::Header;
-use super::method::Method;
-use super::request_error::RequestError;
-use super::target::Target;
-use super::version::Version;
+use crate::http::Header;
+use crate::http::HostClass;
+use crate::http::Method;
+use crate::http::RequestError;
+use crate::http::RequestError::Malformed;
+use crate::http::Target;
+use crate::http::Version;
+use crate::http::grammar::split_once;
+use crate::http::host_class;
 
 /// A parsed HTTP request head: the request line and the header fields.
 pub struct Request {
@@ -74,7 +73,7 @@ impl Request {
       .next()
       .ok_or(Malformed("request line has no version"))?;
 
-    //Check that the request did not include extra invalid information
+    // Check that the request did not include extra invalid information
     if request_line_split.next().is_some() {
       return Err(Malformed("request line has extra fields"));
     }
@@ -112,12 +111,12 @@ impl Request {
   fn validate_host(&self) -> Result<(), RequestError> {
     let host_headers = self.headers.iter().filter(|h| h.name == "host");
 
-    //Check for all versions that host headers does not exceed 1
+    // Check for all versions that host headers does not exceed 1
     if host_headers.clone().count() > 1 {
       return Err(Malformed("host header repeated"));
     }
 
-    //Check for all versions outside 1.0 that host headers is not 0
+    // Check for all versions outside 1.0 that host headers is not 0
     let is_v1_0 = self.version.major == 1 && self.version.minor == 0;
     if !is_v1_0 && host_headers.count() == 0 {
       return Err(Malformed("host header missing"));

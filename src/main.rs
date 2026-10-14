@@ -3,28 +3,16 @@
 
 use std::io;
 
-use crate::event::Event;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
-mod connection;
+use crate::event::Event;
+
 mod event;
-mod frame;
-mod grammar;
-mod header;
-mod host_class;
-mod method;
-mod pages;
-mod request;
-mod request_error;
-mod response;
-mod router;
-mod status;
-mod target;
-mod tcp_snapshot;
-mod version;
-mod viewer;
+mod http;
+mod server;
+mod site;
 mod websocket;
 
 /// Binds to port 8080 on all interfaces and serves each accepted connection
@@ -47,7 +35,7 @@ async fn main() -> io::Result<()> {
   let (tx, mut rx) = broadcast::channel::<Event>(256);
   let mut connection_count: u64 = 0;
 
-  //Task explicitly for logging only
+  // Task explicitly for logging only
   tokio::spawn(async move {
     loop {
       let event = match rx.recv().await {
@@ -82,9 +70,7 @@ async fn main() -> io::Result<()> {
     let tx = tx.clone();
     connection_count = connection_count.wrapping_add(1);
     tokio::spawn(async move {
-      if let Err(e) =
-        connection::handle(stream, peer, tx, connection_count).await
-      {
+      if let Err(e) = server::handle(stream, peer, tx, connection_count).await {
         eprintln!("{peer}: {e}");
       }
     });

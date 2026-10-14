@@ -13,10 +13,10 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::event::Event;
-use crate::frame::Frame;
-use crate::frame::FrameBuffer;
-use crate::frame::FrameError;
-use crate::frame::OpCode;
+use crate::websocket::Frame;
+use crate::websocket::FrameBuffer;
+use crate::websocket::FrameError;
+use crate::websocket::OpCode;
 
 /// The largest payload accepted from a viewer: enough for any control frame,
 /// since a viewer has nothing else to send.

@@ -1,11 +1,13 @@
-//! Routing: decides the response for a valid request.
-use crate::header::Header;
-use crate::method::Method;
-use crate::pages;
-use crate::request::Request;
-use crate::response::Response;
-use crate::status::Status;
-use crate::target::Target;
+//! Routing: decides the response for a valid request, and builds error
+//! responses with the error page as their body.
+
+use crate::http::Header;
+use crate::http::Method;
+use crate::http::Request;
+use crate::http::Response;
+use crate::http::Status;
+use crate::http::Target;
+use crate::site;
 use crate::websocket;
 
 /// Chooses the response for `request`.
@@ -20,7 +22,7 @@ use crate::websocket;
 /// reads nothing from the connection and cannot fail.
 pub fn route(request: &Request) -> Response {
   if !matches!(request.method, Method::Get) {
-    let mut response = Response::from_status(Status::MethodNotAllowed);
+    let mut response = error_response(Status::MethodNotAllowed);
     response.headers.push(Header {
       name: "Allow".to_string(),
       value: b"GET".to_vec(),
@@ -29,23 +31,28 @@ pub fn route(request: &Request) -> Response {
   }
 
   let Target::Origin(target) = &request.target else {
-    return Response::from_status(Status::NotFound);
+    return error_response(Status::NotFound);
   };
 
   let resource = target.split('?').next();
 
   match resource {
-    Some("/") => Response::ok(pages::index(request)),
-    Some("/debug") => Response::ok(pages::debug()),
-    Some("/ws") => websocket::upgrade(request),
-    Some(_) | None => Response::from_status(Status::NotFound),
+    Some("/") => Response::ok(site::index(request)),
+    Some("/debug") => Response::ok(site::debug()),
+    Some("/ws") => websocket::upgrade(request).unwrap_or_else(error_response),
+    Some(_) | None => error_response(Status::NotFound),
   }
+}
+
+/// Builds the response for `status` with the error page as its body.
+pub fn error_response(status: Status) -> Response {
+  Response::new(status, site::error(status))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::version::Version;
+  use crate::http::Version;
 
   fn request(method: Method, target: Target) -> Request {
     Request {

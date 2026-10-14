@@ -64,3 +64,6 @@ redundant_clone = "deny"              # remove unnecessary .clone() calls
 cast_lossless = "deny"                # use From/Into instead of `as` for lossless casts
 cast_possible_truncation = "warn"     # narrowing `as` casts
 arithmetic_side_effects = "warn"      # overflow on untrusted lengths; use checked_/saturating_
+
+# --- Layout ---
+self_named_module_files = "deny"      # use foo/mod.rs, not foo.rs beside foo/

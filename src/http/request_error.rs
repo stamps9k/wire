@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 
-use crate::status::Status;
+use crate::http::Status;
 
 impl From<io::Error> for RequestError {
   fn from(e: io::Error) -> Self {

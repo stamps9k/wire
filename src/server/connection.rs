@@ -2,16 +2,6 @@
 //! publishes an event describing the connection, and hands a connection that
 //! upgraded to WebSocket over to [`viewer`].
 
-use crate::event;
-use crate::event::Event;
-use crate::event::Kind;
-use crate::event::RejectReason;
-use crate::request_error::RequestError;
-use crate::response::Response;
-use crate::router;
-use crate::status::Status;
-use crate::viewer;
-
 use std::io;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -24,7 +14,16 @@ use tokio::sync::broadcast::Sender;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-use super::request::Request;
+use crate::event;
+use crate::event::Event;
+use crate::event::Kind;
+use crate::event::RejectReason;
+use crate::http::Request;
+use crate::http::RequestError;
+use crate::http::Response;
+use crate::http::Status;
+use crate::server::viewer;
+use crate::site;
 
 /// Serves one client connection from start to finish.
 ///
@@ -66,7 +65,7 @@ pub async fn handle(
 
   let bytes = match &result {
     Ok((_, response)) => Some(response.to_bytes()),
-    Err(e) => e.status().map(|s| Response::from_status(s).to_bytes()),
+    Err(e) => e.status().map(|s| site::error_response(s).to_bytes()),
   };
 
   let written = match &bytes {
@@ -131,7 +130,7 @@ async fn serve(
   let request = Request::parse(buffer)?;
   request.validate()?;
 
-  let result = router::route(&request);
+  let result = site::route(&request);
 
   Ok((request, result))
 }

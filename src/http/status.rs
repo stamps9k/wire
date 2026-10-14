@@ -1,5 +1,5 @@
 /// An HTTP response status.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Status {
   Ok,
   BadRequest,

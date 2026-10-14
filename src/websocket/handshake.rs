@@ -2,11 +2,10 @@
 //! upgrade request and builds the response that accepts or refuses it.
 //! Frames are built and parsed in `frame`.
 
-use crate::grammar;
-use crate::header::Header;
-use crate::request::Request;
-use crate::response::Response;
-use crate::status::Status;
+use crate::http::Header;
+use crate::http::Request;
+use crate::http::Response;
+use crate::http::Status;
 
 use base64::engine::Engine;
 use sha1::{Digest, Sha1};
@@ -15,33 +14,34 @@ use sha1::{Digest, Sha1};
 ///
 /// A request that passes `validate` gets 101 Switching Protocols with the
 /// `Upgrade`, `Connection` and `Sec-WebSocket-Accept` headers and no body.
-/// Any other request gets an error page with the status that `validate`
-/// returned.
 ///
 /// The method is not checked here. The router only passes on `GET`
 /// requests.
-pub fn upgrade(request: &Request) -> Response {
-  match validate(request) {
-    Ok(key) => Response {
-      status: Status::SwitchingProtocols,
-      headers: vec![
-        Header {
-          name: "Upgrade".to_string(),
-          value: Vec::from("websocket"),
-        },
-        Header {
-          name: "Connection".to_string(),
-          value: Vec::from("upgrade"),
-        },
-        Header {
-          name: "Sec-WebSocket-Accept".to_string(),
-          value: response_key(key),
-        },
-      ],
-      body: Vec::new(),
-    },
-    Err(e) => Response::from_status(e),
-  }
+///
+/// # Errors
+///
+/// Returns the status that `validate` chose if the request is not a valid
+/// upgrade, for the caller to answer with.
+pub fn upgrade(request: &Request) -> Result<Response, Status> {
+  let key = validate(request)?;
+  Ok(Response {
+    status: Status::SwitchingProtocols,
+    headers: vec![
+      Header {
+        name: "Upgrade".to_string(),
+        value: Vec::from("websocket"),
+      },
+      Header {
+        name: "Connection".to_string(),
+        value: Vec::from("upgrade"),
+      },
+      Header {
+        name: "Sec-WebSocket-Accept".to_string(),
+        value: response_key(key),
+      },
+    ],
+    body: Vec::new(),
+  })
 }
 
 /// Computes the `Sec-WebSocket-Accept` value for a client's key.
@@ -107,11 +107,7 @@ fn header_has_token(headers: &[Header], name: &str, token: &[u8]) -> bool {
   headers
     .iter()
     .filter(|h| h.name.eq_ignore_ascii_case(name))
-    .any(|h| {
-      h.value
-        .split(|&i| i == b',')
-        .any(|s| grammar::trim_ows(s).eq_ignore_ascii_case(token))
-    })
+    .any(|h| h.has_token(token))
 }
 
 /// Finds the `Sec-WebSocket-Key` header and checks its value.
@@ -148,9 +144,9 @@ fn websocket_key(headers: &[Header]) -> Result<&[u8], Status> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::method::Method;
-  use crate::target::Target;
-  use crate::version::Version;
+  use crate::http::Method;
+  use crate::http::Target;
+  use crate::http::Version;
 
   /// The example key from RFC 6455. It decodes to 16 bytes.
   const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -403,34 +399,39 @@ mod tests {
   }
 
   #[test]
-  fn upgrade_answers_a_correct_request_with_101() {
-    let response = upgrade(&request(1, valid_headers()));
+  fn upgrade_answers_a_correct_request_with_101() -> Result<(), Status> {
+    let response = upgrade(&request(1, valid_headers()))?;
     assert_eq!(response.status.code(), 101);
     assert!(response.body.is_empty());
+    Ok(())
   }
 
   #[test]
-  fn upgrade_computes_the_accept_value_of_the_rfc_example() {
-    let response = upgrade(&request(1, valid_headers()));
+  fn upgrade_computes_the_accept_value_of_the_rfc_example() -> Result<(), Status>
+  {
+    let response = upgrade(&request(1, valid_headers()))?;
     assert_eq!(
       value(&response, "sec-websocket-accept"),
       Some(b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".as_slice())
     );
+    Ok(())
   }
 
   #[test]
-  fn upgrade_computes_the_accept_value_from_the_key_sent() {
+  fn upgrade_computes_the_accept_value_from_the_key_sent() -> Result<(), Status>
+  {
     let key = "AAAAAAAAAAAAAAAAAAAAAA==";
-    let response = upgrade(&with("sec-websocket-key", key));
+    let response = upgrade(&with("sec-websocket-key", key))?;
     assert_eq!(
       value(&response, "sec-websocket-accept"),
       Some(b"ICX+Yqv66kxgM0FcWaLWlFLwTAI=".as_slice())
     );
+    Ok(())
   }
 
   #[test]
-  fn upgrade_sends_exactly_the_three_handshake_headers() {
-    let response = upgrade(&request(1, valid_headers()));
+  fn upgrade_sends_exactly_the_three_handshake_headers() -> Result<(), Status> {
+    let response = upgrade(&request(1, valid_headers()))?;
     assert_eq!(response.headers.len(), 3);
     assert!(
       value(&response, "upgrade")
@@ -440,12 +441,14 @@ mod tests {
       value(&response, "connection")
         .is_some_and(|v| v.eq_ignore_ascii_case(b"upgrade"))
     );
+    Ok(())
   }
 
   #[test]
-  fn upgrade_answers_a_failed_handshake_with_400() {
-    let response = upgrade(&without("sec-websocket-key"));
-    assert_eq!(response.status.code(), 400);
-    assert!(value(&response, "sec-websocket-accept").is_none());
+  fn upgrade_refuses_a_failed_handshake_with_400() {
+    assert!(matches!(
+      upgrade(&without("sec-websocket-key")),
+      Err(Status::BadRequest)
+    ));
   }
 }

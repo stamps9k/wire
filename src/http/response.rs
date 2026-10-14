@@ -1,14 +1,13 @@
 //! Responses: the message sent back to the client and its wire format.
 //!
 //! A [`Response`] holds a status, any extra headers and a body.
-//! [`Response::to_bytes`] adds the fixed headers and serialises it. Page
-//! bodies come from [`pages`].
-
-use crate::header::Header;
-use crate::pages;
-use crate::status::Status;
+//! [`Response::to_bytes`] adds the fixed headers and serialises it. The
+//! body is supplied by the caller.
 
 use std::fmt::Write as _;
+
+use crate::http::Header;
+use crate::http::Status;
 
 /// An HTTP response: a status, extra headers and an HTML body.
 ///
@@ -21,12 +20,12 @@ pub struct Response {
 }
 
 impl Response {
-  /// Builds a response whose body is a small page naming status.
-  pub fn from_status(status: Status) -> Response {
+  /// Builds a response with `status` and `body` and no extra headers.
+  pub fn new(status: Status, body: Vec<u8>) -> Response {
     Response {
       status,
       headers: Vec::new(),
-      body: pages::error(status),
+      body,
     }
   }
 
@@ -79,11 +78,7 @@ impl Response {
 
   /// Builds a 200 response with `body` and no extra headers.
   pub fn ok(body: Vec<u8>) -> Response {
-    Response {
-      status: Status::Ok,
-      headers: Vec::new(),
-      body,
-    }
+    Response::new(Status::Ok, body)
   }
 }
 
@@ -100,18 +95,11 @@ mod tests {
   }
 
   #[test]
-  fn from_status_keeps_the_status() {
-    let response = Response::from_status(Status::BadRequest);
+  fn new_keeps_the_status_and_body_with_no_extra_headers() {
+    let response = Response::new(Status::BadRequest, b"oops".to_vec());
     assert!(matches!(response.status, Status::BadRequest));
-  }
-
-  #[test]
-  fn from_status_body_shows_code_and_reason() {
-    let response = Response::from_status(Status::BadRequest);
-    let body = String::from_utf8_lossy(&response.body);
-    assert!(body.starts_with("<!doctype html>"));
-    assert!(body.contains("<p>Error Code: 400</p>"));
-    assert!(body.contains("<p>Reason: Bad Request</p>"));
+    assert!(response.headers.is_empty());
+    assert_eq!(response.body, b"oops");
   }
 
   #[test]
@@ -147,7 +135,7 @@ mod tests {
 
   #[test]
   fn to_bytes_uses_the_status_for_the_status_line() {
-    let bytes = Response::from_status(Status::BadRequest).to_bytes();
+    let bytes = Response::new(Status::BadRequest, Vec::new()).to_bytes();
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
   }

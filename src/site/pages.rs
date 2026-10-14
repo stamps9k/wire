@@ -1,13 +1,12 @@
 //! HTML bodies for the pages wire serves.
 //!
 //! Each function returns only a body. The status and headers are chosen by
-//! the router or by
-//! [`Response::from_status`](crate::response::Response::from_status).
+//! the router.
 
 use std::fmt::Write as _;
 
-use crate::request::Request;
-use crate::status::Status;
+use crate::http::Request;
+use crate::http::Status;
 
 /// Builds an HTML page that echoes the request head back to the client.
 ///
@@ -30,7 +29,7 @@ pub fn index(request: &Request) -> Vec<u8> {
     );
   }
 
-  include_str!("../public/index.html")
+  include_str!("../../public/index.html")
     .replace("__METHOD__", &request.method.to_string())
     .replace("__TARGET__", &request.target.to_string())
     .replace("__VERSION__", &request.version.to_string())
@@ -42,7 +41,7 @@ pub fn index(request: &Request) -> Vec<u8> {
 ///
 /// The page is static: it does not depend on the request.
 pub fn debug() -> Vec<u8> {
-  include_str!("../public/debug.html").as_bytes().to_vec()
+  include_str!("../../public/debug.html").as_bytes().to_vec()
 }
 
 /// Builds an HTML page showing the code and reason phrase of `status`.
@@ -62,10 +61,10 @@ pub fn error(status: Status) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::header::Header;
-  use crate::method::Method;
-  use crate::target::Target;
-  use crate::version::Version;
+  use crate::http::Header;
+  use crate::http::Method;
+  use crate::http::Target;
+  use crate::http::Version;
 
   fn request(headers: Vec<Header>) -> Request {
     Request {
