@@ -28,12 +28,53 @@ ever sends valid HTTP.
 
 ## Status
 
-Early development.
+Early development. The HTTP server, the event feed and the WebSocket viewer
+work; `TCP_INFO` and eBPF are next, after a first public rollout.
 
-- [ ] HTTP/1.1 server with per-connection `TCP_INFO` *(in progress)*
-- [ ] WebSocket live feed shared between clients
+- [x] HTTP/1.1 server: request parsing and validation, routing, error
+  responses
+- [x] Event bus: one JSON event per connection, broadcast to every subscriber
+- [x] WebSocket live feed shared between clients, with a text debug page
+- [ ] Per-connection `TCP_INFO` snapshots
+- [ ] Classification of non-HTTP junk traffic
 - [ ] eBPF tracing of all TCP state changes
 - [ ] Production container deployment
+
+## Endpoints
+
+- `GET /` shows the parsed request line and headers.
+- `GET /debug` is a text page that connects to `/ws` and prints every event
+  as it arrives.
+- `GET /ws` upgrades to a WebSocket and streams every event as a JSON text
+  frame, starting with the viewer's own handshake.
+
+Every connection, valid or not, also produces one event, printed to stdout as
+one line of JSON.
+
+## Code layout
+
+```
+src/
+  main.rs       accept loop, event channel, stdout subscriber
+  http/         HTTP/1.1 parsing, validation, statuses and responses
+  websocket/    WebSocket opening handshake and frames (RFC 6455)
+  site/         routing and HTML pages, including error pages
+  event/        the event record broadcast for each connection
+  server/       per-connection handling and WebSocket viewers (tokio)
+```
+
+Dependencies only point downward: `server` uses `site`, `site` uses
+`websocket` and `http`, and `websocket` uses `http`. `http` and `websocket`
+are pure protocol code with no I/O and no tokio: they take bytes or parsed
+values and return values, so they can be tested without sockets. `http` and
+`websocket` only ever decide a status; every page, error pages included, is
+built in `site`, and only `server` writes to the network. Error responses
+carry nothing but the status code and reason phrase, never text from the
+request.
+
+Modules use the `mod.rs` style (enforced by clippy's
+`self_named_module_files`), each `mod.rs` only declares its children and
+re-exports what other modules need, and imports use `crate::` paths.
 
 ## Requirements
 
