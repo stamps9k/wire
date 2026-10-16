@@ -1,22 +1,59 @@
 //! HTML bodies for the pages wire serves.
 //!
-//! Each function returns only a body. The status and headers are chosen by
+//! Each page function returns only a body. The status and headers are chosen by
 //! the router.
 
 use std::fmt::Write as _;
 
+use crate::http::Method;
 use crate::http::Request;
 use crate::http::Status;
+use crate::http::Target;
+use crate::http::Version;
+use crate::site::html::escape;
+use crate::site::html::render;
+
+/// Renders every page that is built from a template, and discards the
+/// result.
+///
+/// Whether rendering succeeds depends only on the template and the
+/// placeholder names, which are fixed at compile time, never on the request.
+/// So one render with a dummy request proves that every later render will
+/// succeed. Call this at startup, before accepting connections, so that a
+/// broken template stops the server instead of making every request for
+/// that page return an empty reply.
+///
+/// Add each new templated page here.
+///
+/// # Panics
+///
+/// Panics if any template is invalid. See [`index`].
+pub fn validate_templates() {
+  let test_request = Request {
+    method: Method::Get,
+    target: Target::Asterisk,
+    version: Version { major: 1, minor: 1 },
+    headers: Vec::new(),
+  };
+
+  let _ = index(&test_request);
+}
 
 /// Builds an HTML page that echoes the request head back to the client.
 ///
-/// The method, target and version are inserted exactly as they were parsed,
-/// followed by the header fields in the order they were received. Header
-/// values are raw bytes, so any that are not valid UTF-8 are shown with
-/// replacement characters.
-//
-// TODO: escape the values for HTML before this is reachable from the public
-// address. The target, method and header fields are client-controlled.
+/// Shows the method, target and version, followed by the header fields in
+/// the order they were received. Every value comes from the client, so each
+/// one is HTML-escaped with [`escape`] before it is inserted into
+/// `public/index.html`. Header values are raw bytes, so any that are not
+/// valid UTF-8 are shown with replacement characters.
+///
+/// # Panics
+///
+/// Panics if `public/index.html` contains a placeholder other than the four
+/// this function supplies, or an unclosed `{{`. The template and the keys are
+/// both fixed at compile time, so this cannot depend on the request. The
+/// `index_*` tests and the startup check catch it before the server accepts
+/// connections.
 pub fn index(request: &Request) -> Vec<u8> {
   let mut headers = String::new();
   for header in &request.headers {
@@ -24,16 +61,28 @@ pub fn index(request: &Request) -> Vec<u8> {
     let _ = write!(
       headers,
       "<li>{}: {}</li>",
-      header.name,
-      String::from_utf8_lossy(&header.value)
+      escape(&header.name),
+      escape(&String::from_utf8_lossy(&header.value))
     );
   }
 
-  include_str!("../../public/index.html")
-    .replace("__METHOD__", &request.method.to_string())
-    .replace("__TARGET__", &request.target.to_string())
-    .replace("__VERSION__", &request.version.to_string())
-    .replace("__HEADERS__", headers.as_str())
+  let template = include_str!("../../public/index.html");
+  let method = escape(&request.method.to_string());
+  let target = escape(&request.target.to_string());
+  let version = escape(&request.version.to_string());
+  let values = [
+    ("METHOD", method.as_str()),
+    ("TARGET", target.as_str()),
+    ("VERSION", version.as_str()),
+    ("HEADERS", headers.as_str()),
+  ];
+
+  #[allow(
+    clippy::expect_used,
+    reason = "the template and keys are fixed; tested by index_* tests and tested on startup"
+  )]
+  render(template, &values)
+    .expect("public/index.html has only the placeholders index supplies")
     .into_bytes()
 }
 
@@ -101,7 +150,7 @@ mod tests {
   #[test]
   fn debug_has_no_placeholders() {
     let body = String::from_utf8_lossy(&debug()).into_owned();
-    assert!(!body.contains("__"));
+    assert!(!body.contains("{{"));
   }
 
   #[test]
@@ -130,7 +179,7 @@ mod tests {
   #[test]
   fn index_replaces_every_placeholder() {
     let body = index_text(&request(vec![header("host", b"a")]));
-    assert!(!body.contains("__"));
+    assert!(!body.contains("{{"));
   }
 
   #[test]
@@ -182,5 +231,43 @@ mod tests {
     assert!(body.contains("<p>Error Code: 408</p>"));
     assert!(body.contains("<p>Reason: Request Timeout</p>"));
     assert!(!body.contains("404"));
+  }
+
+  #[test]
+  fn index_escapes_the_target() {
+    let request = Request {
+      method: Method::Get,
+      target: Target::Origin("/?<script>alert(1)</script>".to_owned()),
+      version: Version { major: 1, minor: 1 },
+      headers: Vec::new(),
+    };
+    let body = index_text(&request);
+    assert!(
+      body.contains("<p>Target: /?&lt;script&gt;alert(1)&lt;/script&gt;</p>")
+    );
+    assert!(!body.contains("<script>"));
+  }
+
+  #[test]
+  fn index_escapes_header_values() {
+    let body = index_text(&request(vec![header("x-a", b"<b>\"'&")]));
+    assert!(body.contains("<li>x-a: &lt;b&gt;&quot;&#39;&amp;</li>"));
+  }
+
+  #[test]
+  fn index_does_not_expand_placeholders_from_the_request() {
+    let request = Request {
+      method: Method::Get,
+      target: Target::Origin("/{{HEADERS}}".to_owned()),
+      version: Version { major: 1, minor: 1 },
+      headers: vec![header("host", b"a")],
+    };
+    let body = index_text(&request);
+    assert!(body.contains("<p>Target: /{{HEADERS}}</p>"));
+  }
+
+  #[test]
+  fn validate_templates_passes() {
+    validate_templates();
   }
 }
