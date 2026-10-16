@@ -4,6 +4,10 @@
 //! the connection.
 
 use std::io::Error;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -27,6 +31,8 @@ const MAX_FRAME_PAYLOAD: usize = 125;
 ///
 /// Each event received on `rx` is serialised to JSON and written to
 /// `stream` as one text frame (see [`Frame::text`] and [`Frame::to_bytes`]).
+/// Before serialising, the peer address is reduced to its network with
+/// [`truncate_peer_address`], so a viewer never sees a client's full address.
 /// Only events sent after `rx` was subscribed are seen. If the viewer falls
 /// behind and the channel drops events, the missed ones are skipped and
 /// streaming carries on with the next. An event that cannot be serialised
@@ -62,11 +68,12 @@ where
   loop {
     tokio::select! {
       result = rx.recv() => {
-        let event = match result {
+        let mut event = match result {
           Ok(v) => v,
           Err(RecvError::Lagged(_)) => continue,
           Err(RecvError::Closed) => break,
         };
+        event.peer_address = truncate_peer_address(event.peer_address);
         let Ok(event_s) = serde_json::to_string(&event) else {
           continue;
         };
@@ -127,6 +134,28 @@ where
   }
 
   Ok(())
+}
+
+/// Reduces `address` to its network, for showing to viewers.
+///
+/// IPv4 addresses keep their first 24 bits and IPv6 addresses their first
+/// 48. The port is set to 0. An IPv4-mapped IPv6 address is first turned
+/// back into IPv4, so it is cut to a /24 and does not keep the whole IPv4
+/// address inside a /48.
+///
+/// Viewers see a JSON string like `203.0.113.0:0` or `[2001:db8:abcd::]:0`,
+/// which should be read as the /24 or /48 network.
+fn truncate_peer_address(address: SocketAddr) -> SocketAddr {
+  let masked_ip = match address.ip().to_canonical() {
+    IpAddr::V4(v4) => {
+      IpAddr::V4(Ipv4Addr::from_bits(v4.to_bits() & 0xFFFF_FF00))
+    }
+    IpAddr::V6(v6) => {
+      IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & (!0u128 << 80)))
+    }
+  };
+
+  SocketAddr::new(masked_ip, 0)
 }
 
 #[cfg(test)]
@@ -338,10 +367,12 @@ mod tests {
     let (tx, rx) = broadcast::channel::<Event>(16);
     let first = event(1);
     let second = event(2);
-    let expected = [
-      serde_json::to_string(&first)?,
-      serde_json::to_string(&second)?,
-    ];
+    let shown = |event: &Event| {
+      let mut event = event.clone();
+      event.peer_address = SocketAddr::from(([203, 0, 113, 0], 0));
+      serde_json::to_string(&event)
+    };
+    let expected = [shown(&first)?, shown(&second)?];
     let _ = tx.send(first);
     let _ = tx.send(second);
     drop(tx);
@@ -663,6 +694,75 @@ mod tests {
     let outcome = timeout(WAIT, stream_events(&mut server, rx)).await;
 
     assert!(outcome.is_ok());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn never_broadcasts_the_full_peer_address() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    let _ = tx.send(event(1));
+    drop(tx);
+
+    let written = run(rx).await?;
+
+    let payloads = payloads(&written).ok_or("not a run of text frames")?;
+    let text = String::from_utf8_lossy(payloads.first().ok_or("no frame")?);
+    assert!(text.contains(r#""peer_address":"203.0.113.0:0""#));
+    assert!(!text.contains("203.0.113.9"));
+    assert!(!text.contains("51234"));
+    Ok(())
+  }
+
+  fn address(text: &str) -> Result<SocketAddr, std::net::AddrParseError> {
+    text.parse()
+  }
+
+  #[test]
+  fn truncate_keeps_the_ipv4_slash_24_and_drops_the_port() -> TestResult {
+    let truncated = truncate_peer_address(address("203.0.113.9:51234")?);
+    assert_eq!(truncated, address("203.0.113.0:0")?);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_zeroes_the_whole_last_ipv4_octet() -> TestResult {
+    let truncated = truncate_peer_address(address("198.51.100.255:1")?);
+    assert_eq!(truncated, address("198.51.100.0:0")?);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_keeps_the_ipv6_slash_48_and_drops_the_port() -> TestResult {
+    let original = address("[2001:db8:abcd:12:34:56:78:9a]:443")?;
+    assert_eq!(
+      truncate_peer_address(original),
+      address("[2001:db8:abcd::]:0")?
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_cuts_ipv6_exactly_after_the_third_group() -> TestResult {
+    let original = address("[2001:db8:ffff:ffff::1]:1")?;
+    assert_eq!(
+      truncate_peer_address(original),
+      address("[2001:db8:ffff::]:0")?
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_treats_ipv4_mapped_ipv6_as_ipv4() -> TestResult {
+    let truncated =
+      truncate_peer_address(address("[::ffff:203.0.113.9]:51234")?);
+    assert_eq!(truncated, address("203.0.113.0:0")?);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_is_unchanged_on_an_already_truncated_address() -> TestResult {
+    let once = truncate_peer_address(address("203.0.113.9:51234")?);
+    assert_eq!(truncate_peer_address(once), once);
     Ok(())
   }
 }

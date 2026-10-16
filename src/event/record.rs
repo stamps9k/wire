@@ -37,7 +37,8 @@ pub struct Event {
   /// Counter assigned when the connection is accepted. Ties together
   /// events that belong to the same connection.
   pub connection_id: u64,
-  /// The client's IP address and port.
+  /// The client's full IP address and port. Logged in full; viewers
+  /// receive only the network (see `server::viewer`).
   pub peer_address: SocketAddr,
   /// When the connection was accepted, in milliseconds since the Unix
   /// epoch.
