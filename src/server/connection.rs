@@ -4,12 +4,14 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -36,14 +38,19 @@ use crate::site;
 ///
 /// One [`Event`] describing the connection is sent on `tx` after the write,
 /// whatever the outcome. `connection_id` is the number given to this
-/// connection when it was accepted.
+/// connection when it was accepted. `viewer_pool` holds the slots for
+/// WebSocket viewers.
 ///
-/// If the response was 101 Switching Protocols and was written successfully,
-/// the connection becomes a viewer. It subscribes to `tx` before its own
-/// event is sent, so that event is the first one it receives. Then
-/// [`viewer::stream_events`] keeps the connection open and streams every
-/// event to the client until the client goes away. Any other connection is
-/// closed when this function returns.
+/// If the response is 101 Switching Protocols, a slot is taken from
+/// `viewer_pool` before anything is written. If none is free, the response
+/// is replaced with 503 Service Unavailable and the connection is closed
+/// like any other. Otherwise, once the 101 is written successfully, the
+/// connection becomes a viewer and keeps its slot until this function
+/// returns. It subscribes to `tx` before its own event is sent, so that
+/// event is the first one it receives. Then [`viewer::stream_events`] keeps
+/// the connection open and streams every event to the client until the
+/// client goes away. Any other connection is closed when this function
+/// returns.
 ///
 /// # Errors
 ///
@@ -56,12 +63,24 @@ pub async fn handle(
   addr: SocketAddr,
   tx: Sender<Event>,
   connection_id: u64,
+  viewer_pool: Arc<Semaphore>,
 ) -> Result<(), RequestError> {
   let start_time = SystemTime::now();
   let started = Instant::now();
   let mut buffer: Vec<u8> = Vec::new();
 
-  let result = serve(&mut stream, &mut buffer).await;
+  let mut result = serve(&mut stream, &mut buffer).await;
+
+  // Held until handle returns, so the viewer slot stays taken while streaming.
+  let mut _viewer_permit = None;
+  if let Ok((_, response)) = &mut result {
+    if matches!(response.status, Status::SwitchingProtocols) {
+      match viewer_pool.try_acquire_owned() {
+        Ok(permit) => _viewer_permit = Some(permit),
+        Err(_) => *response = site::error_response(Status::ServiceUnavailable),
+      }
+    }
+  }
 
   let bytes = match &result {
     Ok((_, response)) => Some(response.to_bytes()),
@@ -285,14 +304,22 @@ mod tests {
     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     \r\n";
 
-  /// Starts `handle` on one loopback connection, as connection 1, and
-  /// returns the client's end of it.
+  /// Starts `handle` on one loopback connection, as connection 1, with one
+  /// free viewer slot, and returns the client's end of it.
   async fn connect(tx: Sender<Event>) -> io::Result<TcpStream> {
+    connect_with(tx, Arc::new(Semaphore::new(1))).await
+  }
+
+  /// Like [`connect`], but with the viewer slots given by `viewers`.
+  async fn connect_with(
+    tx: Sender<Event>,
+    viewers: Arc<Semaphore>,
+  ) -> io::Result<TcpStream> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
       if let Ok((stream, peer)) = listener.accept().await {
-        let _ = handle(stream, peer, tx, 1).await;
+        let _ = handle(stream, peer, tx, 1, viewers).await;
       }
     });
     TcpStream::connect(address).await
@@ -453,5 +480,96 @@ mod tests {
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err("the connection was still subscribed after the client left".into())
+  }
+
+  #[tokio::test]
+  async fn an_upgrade_is_refused_with_503_when_no_viewer_slot_is_free()
+  -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    client.write_all(UPGRADE).await?;
+
+    // Reading to the end only returns once the server has closed.
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+
+    assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_refused_upgrade_publishes_a_503() -> TestResult {
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    client.write_all(UPGRADE).await?;
+
+    let event = timeout(Duration::from_secs(5), rx.recv()).await??;
+
+    assert!(matches!(event.kind, Kind::Request { status: 503, .. }));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_plain_request_does_not_need_a_viewer_slot() -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    client
+      .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .await?;
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_second_viewer_is_refused_while_the_first_holds_the_slot()
+  -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let viewers = Arc::new(Semaphore::new(1));
+
+    let mut first = connect_with(tx.clone(), viewers.clone()).await?;
+    first.write_all(UPGRADE).await?;
+    let head =
+      timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
+    assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+    let mut second = connect_with(tx, viewers).await?;
+    second.write_all(UPGRADE).await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), second.read_to_end(&mut response))
+      .await??;
+
+    assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_viewer_holds_its_slot_until_the_client_has_gone() -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let viewers = Arc::new(Semaphore::new(1));
+    let mut client = connect_with(tx.clone(), viewers.clone()).await?;
+    client.write_all(UPGRADE).await?;
+    timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
+    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+
+    assert_eq!(viewers.available_permits(), 0);
+
+    drop(client);
+
+    // As in the test above, the server only notices on a write, so keep
+    // sending until it lets go of the slot.
+    for connection_id in 100..600 {
+      if viewers.available_permits() == 1 {
+        return Ok(());
+      }
+      let _ = tx.send(event(connection_id));
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the viewer slot was not released after the client left".into())
   }
 }

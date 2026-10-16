@@ -8,6 +8,7 @@ pub enum Status {
   MethodNotAllowed,
   NotFound,
   SwitchingProtocols,
+  ServiceUnavailable,
 }
 
 impl Status {
@@ -21,6 +22,7 @@ impl Status {
       Self::RequestTimeout => 408,
       Self::MethodNotAllowed => 405,
       Self::NotFound => 404,
+      Self::ServiceUnavailable => 503,
     }
   }
 
@@ -34,6 +36,7 @@ impl Status {
       Self::RequestTimeout => "Request Timeout",
       Self::MethodNotAllowed => "Method Not Allowed",
       Self::NotFound => "Not Found",
+      Self::ServiceUnavailable => "Service Unavailable",
     }
   }
 }
@@ -51,6 +54,7 @@ mod tests {
     assert_eq!(Status::RequestTooLarge.code(), 431);
     assert_eq!(Status::NotFound.code(), 404);
     assert_eq!(Status::MethodNotAllowed.code(), 405);
+    assert_eq!(Status::ServiceUnavailable.code(), 503);
   }
 
   #[test]
@@ -62,5 +66,6 @@ mod tests {
     assert_eq!(Status::RequestTooLarge.reason(), "Request Too Large");
     assert_eq!(Status::NotFound.reason(), "Not Found");
     assert_eq!(Status::MethodNotAllowed.reason(), "Method Not Allowed");
+    assert_eq!(Status::ServiceUnavailable.reason(), "Service Unavailable");
   }
 }

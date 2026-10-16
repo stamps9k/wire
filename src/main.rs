@@ -25,10 +25,20 @@ mod websocket;
 /// as its task runs. When none are free, the accept loop waits, and new
 /// clients queue in the kernel's listen backlog until a permit is released.
 ///
-/// WebSocket viewers stay connected and count against this limit like any
-/// other connection, so enough of them can block ordinary requests. Keep
-/// this well below the process's open file limit (`ulimit -n`).
+/// WebSocket viewers count against this limit too, but are also limited
+/// separately by [`MAX_VIEWERS`], so they cannot take every connection and
+/// block ordinary requests. Keep this well below the process's open file
+/// limit (`ulimit -n`).
 const MAX_CONNECTIONS: usize = 512;
+
+/// The most WebSocket viewers connected at once.
+///
+/// Viewers stay connected for as long as the client keeps the page open, so
+/// without their own limit they could hold every connection permit. A
+/// connection takes a viewer slot when its upgrade is accepted and holds it
+/// until the viewer disconnects. An upgrade that arrives when no slot is free
+/// is answered with 503 Service Unavailable.
+const MAX_VIEWERS: usize = 1;
 
 /// Checks the page templates, then binds to port 8080 on all interfaces and
 /// serves each accepted connection in its own task.
@@ -59,7 +69,8 @@ async fn main() -> io::Result<()> {
   // Validate all templates before starting server
   validate_templates();
 
-  let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+  let connection_pool = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+  let viewer_pool = Arc::new(Semaphore::new(MAX_VIEWERS));
   let listener = TcpListener::bind("0.0.0.0:8080").await?;
   let (tx, mut rx) = broadcast::channel::<Event>(256);
   let mut connection_count: u64 = 0;
@@ -88,7 +99,7 @@ async fn main() -> io::Result<()> {
   });
 
   loop {
-    let permit = match limit.clone().acquire_owned().await {
+    let permit = match connection_pool.clone().acquire_owned().await {
       Ok(c) => c,
       Err(e) => return Err(io::Error::other(e)),
     };
@@ -103,10 +114,13 @@ async fn main() -> io::Result<()> {
     };
 
     let tx = tx.clone();
+    let viewer_pool = viewer_pool.clone();
     connection_count = connection_count.wrapping_add(1);
     tokio::spawn(async move {
       let _permit = permit;
-      if let Err(e) = server::handle(stream, peer, tx, connection_count).await {
+      if let Err(e) =
+        server::handle(stream, peer, tx, connection_count, viewer_pool).await
+      {
         eprintln!("{peer}: {e}");
       }
     });
