@@ -159,6 +159,10 @@ mod tests {
 
   // render
 
+  #[allow(
+    clippy::unnecessary_wraps,
+    reason = "builds the expected Result for comparison with render"
+  )]
   fn ok(text: &str) -> Result<String, RenderError> {
     Ok(text.to_owned())
   }
