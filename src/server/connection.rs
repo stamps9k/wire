@@ -29,6 +29,17 @@ use crate::http::Status;
 use crate::server::viewer;
 use crate::site;
 
+/// The longest a client may take to send its whole request head.
+///
+/// The deadline covers the head as a whole, not each read, so a client that
+/// sends a byte at a time is cut off as surely as one that sends nothing. A
+/// real client sends its head at once, well within this even on a slow
+/// mobile link. Until the deadline, a silent client holds a connection
+/// permit and one of its address's slots, so a short deadline frees them
+/// sooner during a flood. When it passes, the client gets 408 Request
+/// Timeout and the event is rejected with reason `timeout`.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Serves one client connection from start to finish.
 ///
 /// Calls `serve` to read the request and decide the response, then writes
@@ -123,7 +134,7 @@ pub async fn handle(
 
 /// Reads one request from `stream` and decides the response.
 ///
-/// Reads the head into `buffer` with a 10-second deadline, then parses,
+/// Reads the head into `buffer` within [`HEAD_TIMEOUT`], then parses,
 /// validates and routes it. Returns the request together with the response
 /// chosen for it. Nothing is written to the stream.
 ///
@@ -141,9 +152,7 @@ async fn serve(
   stream: &mut TcpStream,
   buffer: &mut Vec<u8>,
 ) -> Result<(Request, Response), RequestError> {
-  let Ok(read) =
-    timeout(Duration::from_secs(10), read_head(stream, buffer)).await
-  else {
+  let Ok(read) = timeout(HEAD_TIMEOUT, read_head(stream, buffer)).await else {
     return Err(RequestError::RequestTimeout);
   };
   read?;
