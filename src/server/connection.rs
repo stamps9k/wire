@@ -449,6 +449,28 @@ mod tests {
     Ok(())
   }
 
+  #[tokio::test(start_paused = true)]
+  async fn a_client_that_sends_nothing_gets_408_after_the_head_timeout()
+  -> TestResult {
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let mut client = connect(tx).await?;
+    // The clock is paused and jumps ahead whenever every task is waiting, so
+    // this runs at once. Twice the deadline leaves room for the server's own.
+    let mut response = Vec::new();
+    timeout(HEAD_TIMEOUT * 2, client.read_to_end(&mut response)).await??;
+    assert!(response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"));
+    let event = timeout(HEAD_TIMEOUT, rx.recv()).await??;
+    assert!(matches!(
+      event.kind,
+      Kind::Rejected {
+        reason: RejectReason::Timeout,
+        detail: None,
+        status: Some(408),
+      }
+    ));
+    Ok(())
+  }
+
   #[tokio::test]
   async fn a_plain_request_is_answered_and_the_connection_closed() -> TestResult
   {
