@@ -7,9 +7,11 @@
 mod kind;
 mod record;
 mod reject_reason;
+mod shed_reason;
 mod tcp_snapshot;
 
 pub use kind::Kind;
 pub use record::{CAP_SIZE, Event, truncate};
 pub use reject_reason::RejectReason;
+pub use shed_reason::ShedReason;
 use tcp_snapshot::TcpSnapshot;

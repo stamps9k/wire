@@ -11,6 +11,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Duration;
 
 use crate::event::Event;
+use crate::event::ShedReason;
+use crate::server::IpLimit;
 use crate::site::validate_templates;
 
 mod event;
@@ -40,11 +42,24 @@ const MAX_CONNECTIONS: usize = 512;
 /// is answered with 503 Service Unavailable.
 const MAX_VIEWERS: usize = 32;
 
+/// The most connections allowed from one client address at once.
+///
+/// A connection from an address that already has this many open is closed
+/// as soon as it is accepted, without reading from it, and published as a
+/// shed event (see [`server::shed`]). Browsers open about six connections to
+/// a host, and many users can share one address behind carrier-grade NAT,
+/// so this leaves room for several real users on one address while stopping
+/// one client from taking every permit in [`MAX_CONNECTIONS`].
+const MAX_IP_COUNT: u32 = 16;
+
 /// Checks the page templates, then binds to port 8080 on all interfaces and
 /// serves each accepted connection in its own task.
 ///
 /// At most [`MAX_CONNECTIONS`] connections are served at once. When that many
-/// are open, accepting pauses until one finishes.
+/// are open, accepting pauses until one finishes. Each client address may
+/// have at most [`MAX_IP_COUNT`] of them open; a connection over that limit
+/// is given a number like any other, then closed at once and published as a
+/// shed event.
 ///
 /// Each connection is given a number, counting from 1, and a sender for the
 /// event channel. A separate task subscribes to that channel and prints
@@ -71,6 +86,7 @@ async fn main() -> io::Result<()> {
 
   let connection_pool = Arc::new(Semaphore::new(MAX_CONNECTIONS));
   let viewer_pool = Arc::new(Semaphore::new(MAX_VIEWERS));
+  let ip_limit: Arc<IpLimit> = Arc::new(IpLimit::new(MAX_IP_COUNT));
   let listener = TcpListener::bind("0.0.0.0:8080").await?;
   let (tx, mut rx) = broadcast::channel::<Event>(256);
   let mut connection_count: u64 = 0;
@@ -113,11 +129,18 @@ async fn main() -> io::Result<()> {
       }
     };
 
+    connection_count = connection_count.wrapping_add(1);
+
+    let Some(ip_permit) = ip_limit.try_acquire(peer.ip()) else {
+      server::shed(connection_count, peer, ShedReason::IpLimit, &tx);
+      continue;
+    };
+
     let tx = tx.clone();
     let viewer_pool = viewer_pool.clone();
-    connection_count = connection_count.wrapping_add(1);
     tokio::spawn(async move {
       let _permit = permit;
+      let _ip_permit = ip_permit;
       if let Err(e) =
         server::handle(stream, peer, tx, connection_count, viewer_pool).await
       {

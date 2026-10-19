@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::event::RejectReason;
+use crate::event::ShedReason;
 use crate::http::HostClass;
 
 /// How a connection ended.
@@ -45,5 +46,12 @@ pub enum Kind {
     detail: Option<&'static str>,
     /// Status code of the error response, or `None` if nothing was sent.
     status: Option<u16>,
+  },
+  /// The connection was closed as soon as it was accepted, because a
+  /// connection limit was reached. Nothing was read from it and no response
+  /// was sent.
+  Shed {
+    /// Which limit was reached.
+    reason: ShedReason,
   },
 }

@@ -60,6 +60,7 @@ pub struct Event {
 mod tests {
   use super::*;
   use crate::event::RejectReason;
+  use crate::event::ShedReason;
   use crate::http::HostClass;
 
   fn assert_broadcastable<T: Clone + Send + 'static>() {}
@@ -145,6 +146,17 @@ mod tests {
       r#""detail":"bad target","#,
       r#""status":400}"#,
     );
+    assert_eq!(json, format!("{COMMON}{kind}"));
+    Ok(())
+  }
+
+  #[test]
+  fn shed_is_one_flat_object() -> Result<(), serde_json::Error> {
+    let kind = Kind::Shed {
+      reason: ShedReason::IpLimit,
+    };
+    let json = serde_json::to_string(&event(kind))?;
+    let kind = r#""kind":"shed","reason":"ip_limit"}"#;
     assert_eq!(json, format!("{COMMON}{kind}"));
     Ok(())
   }

@@ -1,6 +1,7 @@
 //! Per-connection handling: reads the request head, writes the response,
 //! publishes an event describing the connection, and hands a connection that
-//! upgraded to WebSocket over to [`viewer`].
+//! upgraded to WebSocket over to [`viewer`]. Also publishes the event for a
+//! connection refused as soon as it was accepted ([`shed`]).
 
 use std::io;
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use crate::event;
 use crate::event::Event;
 use crate::event::Kind;
 use crate::event::RejectReason;
+use crate::event::ShedReason;
 use crate::http::Request;
 use crate::http::RequestError;
 use crate::http::Response;
@@ -152,6 +154,42 @@ async fn serve(
   let result = site::route(&request);
 
   Ok((request, result))
+}
+
+/// Publishes the [`Event`] for a connection that was closed as soon as it
+/// was accepted.
+///
+/// The event is [`Kind::Shed`] with `reason`. Nothing was read from the
+/// connection or written to it, so its duration and byte count are 0 and it
+/// has no TCP snapshot. `connection_id` is the number given to the
+/// connection when it was accepted, and the timestamp is the current time.
+///
+/// A failed send only means that nobody is subscribed, so it is ignored.
+pub fn shed(
+  connection_id: u64,
+  addr: SocketAddr,
+  reason: ShedReason,
+  tx: &Sender<Event>,
+) {
+  let timestamp_ms = u64::try_from(
+    SystemTime::now()
+      .duration_since(SystemTime::UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_millis(),
+  )
+  .unwrap_or(u64::MAX);
+
+  let kind = Kind::Shed { reason };
+
+  let _ = tx.send(Event {
+    connection_id,
+    peer_address: addr,
+    timestamp_ms,
+    duration_ms: 0,
+    bytes_received: 0,
+    tcp_snapshot: None,
+    kind,
+  });
 }
 
 /// Builds the [`Event`] for a finished connection and sends it on `tx`.
@@ -379,6 +417,27 @@ mod tests {
 
   fn id(event: &Value) -> Option<u64> {
     event.get("connection_id").and_then(Value::as_u64)
+  }
+
+  #[test]
+  fn shed_publishes_an_event_with_nothing_read() -> TestResult {
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let peer = SocketAddr::from(([203, 0, 113, 9], 51_234));
+    shed(5, peer, ShedReason::IpLimit, &tx);
+    let event = rx.try_recv()?;
+    assert_eq!(event.connection_id, 5);
+    assert_eq!(event.peer_address, peer);
+    assert!(event.timestamp_ms > 0);
+    assert_eq!(event.duration_ms, 0);
+    assert_eq!(event.bytes_received, 0);
+    assert!(event.tcp_snapshot.is_none());
+    assert!(matches!(
+      event.kind,
+      Kind::Shed {
+        reason: ShedReason::IpLimit
+      }
+    ));
+    Ok(())
   }
 
   #[tokio::test]
