@@ -24,8 +24,11 @@ mod websocket;
 /// The most connections served at once.
 ///
 /// Each connection holds a permit from a semaphore of this size for as long
-/// as its task runs. When none are free, the accept loop waits, and new
-/// clients queue in the kernel's listen backlog until a permit is released.
+/// as its task runs. When none are free, a new connection is still
+/// accepted, but it is closed at once without reading from it and published
+/// as a shed event (see [`server::shed`]). The accept loop never waits for a
+/// permit, so every connection that reaches the server produces an event,
+/// even during a flood from many addresses.
 ///
 /// WebSocket viewers count against this limit too, but are also limited
 /// separately by [`MAX_VIEWERS`], so they cannot take every connection and
@@ -55,11 +58,11 @@ const MAX_IP_COUNT: u32 = 16;
 /// Checks the page templates, then binds to port 8080 on all interfaces and
 /// serves each accepted connection in its own task.
 ///
-/// At most [`MAX_CONNECTIONS`] connections are served at once. When that many
-/// are open, accepting pauses until one finishes. Each client address may
-/// have at most [`MAX_IP_COUNT`] of them open; a connection over that limit
-/// is given a number like any other, then closed at once and published as a
-/// shed event.
+/// Each client address may have at most [`MAX_IP_COUNT`] connections open,
+/// and at most [`MAX_CONNECTIONS`] are served at once in total. The address
+/// limit is checked first. A connection over either limit is given a number
+/// like any other, then closed at once and published as a shed event; the
+/// loop goes straight on to the next `accept`.
 ///
 /// Each connection is given a number, counting from 1, and a sender for the
 /// event channel. A separate task subscribes to that channel and prints
@@ -72,8 +75,9 @@ const MAX_IP_COUNT: u32 = 16;
 /// # Errors
 ///
 /// Returns an error if the listener cannot bind, for example because the
-/// port is already in use, or if the connection semaphore is closed, which
-/// does not happen in normal running.
+/// port is already in use. Nothing after that returns an error: if the
+/// connection semaphore were ever closed, which does not happen in normal
+/// running, every connection would be shed for capacity instead.
 ///
 /// # Panics
 ///
@@ -115,11 +119,6 @@ async fn main() -> io::Result<()> {
   });
 
   loop {
-    let permit = match connection_pool.clone().acquire_owned().await {
-      Ok(c) => c,
-      Err(e) => return Err(io::Error::other(e)),
-    };
-
     let (stream, peer) = match listener.accept().await {
       Ok(c) => c,
       Err(e) => {
@@ -133,6 +132,11 @@ async fn main() -> io::Result<()> {
 
     let Some(ip_permit) = ip_limit.try_acquire(peer.ip()) else {
       server::shed(connection_count, peer, ShedReason::IpLimit, &tx);
+      continue;
+    };
+
+    let Ok(permit) = connection_pool.clone().try_acquire_owned() else {
+      server::shed(connection_count, peer, ShedReason::Capacity, &tx);
       continue;
     };
 
