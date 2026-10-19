@@ -38,7 +38,7 @@ const MAX_CONNECTIONS: usize = 512;
 /// connection takes a viewer slot when its upgrade is accepted and holds it
 /// until the viewer disconnects. An upgrade that arrives when no slot is free
 /// is answered with 503 Service Unavailable.
-const MAX_VIEWERS: usize = 1;
+const MAX_VIEWERS: usize = 32;
 
 /// Checks the page templates, then binds to port 8080 on all interfaces and
 /// serves each accepted connection in its own task.
