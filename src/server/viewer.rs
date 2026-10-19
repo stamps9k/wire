@@ -8,6 +8,7 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -15,6 +16,7 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::timeout;
 
 use crate::event::Event;
 use crate::websocket::Frame;
@@ -25,6 +27,15 @@ use crate::websocket::OpCode;
 /// The largest payload accepted from a viewer: enough for any control frame,
 /// since a viewer has nothing else to send.
 const MAX_FRAME_PAYLOAD: usize = 125;
+
+/// The longest a single write to a viewer may take.
+///
+/// A write only waits when the socket's send buffer is full, which happens
+/// when the client has stopped reading (a frozen tab, or a client stalling
+/// on purpose). TCP keeps such a connection alive indefinitely, so without
+/// this limit it would hold its viewer slot and connection permit forever.
+/// A healthy client, even a slow one, finishes each write well within it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Streams events to a WebSocket viewer and answers the frames it sends,
 /// until either side ends the connection.
@@ -49,13 +60,19 @@ const MAX_FRAME_PAYLOAD: usize = 125;
 /// answered with a close carrying the code from [`FrameError::close_code`],
 /// which also ends the loop.
 ///
+/// Every write, whether an event, a pong or a close, goes through
+/// [`write_frame`], so a viewer that stops reading is dropped once a write
+/// has waited [`WRITE_TIMEOUT`].
+///
 /// Returns `Ok(())` after a closing handshake, after the client
 /// disconnects, or when the channel closes. In the server the channel
 /// never closes while the connection holds a sender.
 ///
 /// # Errors
 ///
-/// Returns the error from a failed read or write on `stream`.
+/// Returns an error of kind [`TimedOut`](std::io::ErrorKind::TimedOut) if a
+/// write takes longer than [`WRITE_TIMEOUT`], and the error from any other
+/// failed read or write on `stream`.
 pub async fn stream_events<S>(
   stream: &mut S,
   mut rx: Receiver<Event>,
@@ -77,9 +94,8 @@ where
         let Ok(event_s) = serde_json::to_string(&event) else {
           continue;
         };
-        stream
-          .write_all(&Frame::text(event_s.as_bytes()).to_bytes())
-          .await?;
+        let bytes = Frame::text(event_s.as_bytes()).to_bytes();
+        write_frame(stream, &bytes).await?;
       },
       result = stream.read(&mut chunk) => {
         let size = result?;
@@ -101,15 +117,19 @@ where
                     .payload
                     .first_chunk::<2>()
                     .map_or(1000, |bytes| u16::from_be_bytes(*bytes));
-                  stream.write_all(&Frame::close(code, "").to_bytes()).await?;
+                  let bytes = Frame::close(code, "").to_bytes();
+                  write_frame(stream, &bytes).await?;
                   return Ok(());
                 },
                 OpCode::Ping => {
-                  stream.write_all(&Frame {
-                    fin: true,
-                    opcode: OpCode::Pong,
-                    payload: frame.payload,
-                  }.to_bytes()).await?;
+                  write_frame(
+                    stream, &Frame {
+                      fin: true,
+                      opcode: OpCode::Pong,
+                      payload: frame.payload,
+                    }
+                    .to_bytes()
+                  ).await?;
                 },
                 _ => {}
               }
@@ -119,9 +139,8 @@ where
                 FrameError::Protocol(reason) => reason,
                 FrameError::TooLarge => "",
               };
-              stream
-                .write_all(&Frame::close(e.close_code(), reason).to_bytes())
-                .await?;
+              let bytes = Frame::close(e.close_code(), reason).to_bytes();
+              write_frame(stream, &bytes).await?;
               return Ok(());
             }
           }
@@ -156,6 +175,19 @@ fn truncate_peer_address(address: SocketAddr) -> SocketAddr {
   };
 
   SocketAddr::new(masked_ip, 0)
+}
+
+/// Writes `bytes` to `stream`, giving up after [`WRITE_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns an error of kind [`TimedOut`](std::io::ErrorKind::TimedOut) if
+/// the write does not finish in time, or the error from the write itself.
+async fn write_frame<S>(stream: &mut S, bytes: &[u8]) -> Result<(), Error>
+where
+  S: AsyncWrite + Unpin,
+{
+  timeout(WRITE_TIMEOUT, stream.write_all(bytes)).await?
 }
 
 #[cfg(test)]
@@ -763,6 +795,76 @@ mod tests {
   fn truncate_is_unchanged_on_an_already_truncated_address() -> TestResult {
     let once = truncate_peer_address(address("203.0.113.9:51234")?);
     assert_eq!(truncate_peer_address(once), once);
+    Ok(())
+  }
+
+  // ---- write timeout ----
+
+  #[tokio::test(start_paused = true)]
+  async fn gives_up_on_a_viewer_that_stops_reading() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    // One event is bigger than the pipe, so the first write blocks. The
+    // client end must stay alive (not `_`), or the write fails at once
+    // instead of blocking.
+    let (mut server, _client) = tokio::io::duplex(64);
+    for connection_id in 1..=3 {
+      let _ = tx.send(event(connection_id));
+    }
+
+    let started = tokio::time::Instant::now();
+    let result =
+      timeout(WRITE_TIMEOUT * 2, stream_events(&mut server, rx)).await?;
+
+    let error = result.err().ok_or("stream_events returned Ok")?;
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= WRITE_TIMEOUT);
+    drop(tx);
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn does_not_give_up_on_a_slow_reader_that_keeps_up() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (mut server, mut client) = tokio::io::duplex(64);
+    for connection_id in 1..=6 {
+      let _ = tx.send(event(connection_id));
+    }
+    // The six events are still delivered, then the closed channel ends
+    // the loop with Ok.
+    drop(tx);
+
+    // Reads 64 bytes a second. Each frame (about 200 bytes) takes a few
+    // seconds, well inside WRITE_TIMEOUT, but all six together take longer
+    // than WRITE_TIMEOUT. That tells a timeout on each write apart from a
+    // timeout on the whole stream.
+    let reader = tokio::spawn(async move {
+      let mut written = Vec::new();
+      let mut chunk = [0_u8; 64];
+      loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match client.read(&mut chunk).await {
+          Ok(0) | Err(_) => break,
+          Ok(size) => {
+            if let Some(bytes) = chunk.get(..size) {
+              written.extend_from_slice(bytes);
+            }
+          }
+        }
+      }
+      written
+    });
+
+    let started = tokio::time::Instant::now();
+    timeout(WRITE_TIMEOUT * 4, stream_events(&mut server, rx)).await??;
+    assert!(started.elapsed() > WRITE_TIMEOUT);
+    drop(server);
+
+    let written = reader.await?;
+    let payloads = payloads(&written).ok_or("not a run of text frames")?;
+    assert_eq!(
+      ids(&payloads)?,
+      [Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+    );
     Ok(())
   }
 }
