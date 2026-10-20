@@ -19,6 +19,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
 use crate::event::Event;
+use crate::event::Kind;
 use crate::websocket::Frame;
 use crate::websocket::FrameBuffer;
 use crate::websocket::FrameError;
@@ -43,11 +44,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Each event received on `rx` is serialised to JSON and written to
 /// `stream` as one text frame (see [`Frame::text`] and [`Frame::to_bytes`]).
 /// Before serialising, the peer address is reduced to its network with
-/// [`truncate_peer_address`], so a viewer never sees a client's full address.
-/// Only events sent after `rx` was subscribed are seen. If the viewer falls
-/// behind and the channel drops events, the missed ones are skipped and
-/// streaming carries on with the next. An event that cannot be serialised
-/// is skipped.
+/// [`truncate_peer_address`], so a viewer never sees a client's full address,
+/// and the detail of a rejection is removed with [`truncate_kind`]. Standard
+/// output still gets the full event. Only events sent after `rx` was subscribed
+/// are seen. If the viewer falls behind and the channel drops events, the
+/// missed ones are skipped and streaming carries on with the next. An event
+/// that cannot be serialised is skipped.
 ///
 /// At the same time, bytes from the client are collected in a
 /// [`FrameBuffer`] and taken from it one frame at a time, with a payload cap
@@ -91,6 +93,7 @@ where
           Err(RecvError::Closed) => break,
         };
         event.peer_address = truncate_peer_address(event.peer_address);
+        event.kind = truncate_kind(event.kind);
         let Ok(event_s) = serde_json::to_string(&event) else {
           continue;
         };
@@ -155,6 +158,41 @@ where
   Ok(())
 }
 
+/// Removes from `kind` what viewers should not see.
+///
+/// A rejection's `detail`, which names the parser check that failed, is set
+/// to `None`, so watching the stream does not reveal what the generic 400
+/// response hides. The field stays in the JSON as `null`, so every event of
+/// a kind has the same shape. Every other variant is returned unchanged.
+///
+/// Every variant and field is named in the match, so a new one does not
+/// compile until it has been decided here what viewers may see of it.
+fn truncate_kind(kind: Kind) -> Kind {
+  match kind {
+    Kind::Rejected {
+      reason,
+      detail: _,
+      status,
+    } => Kind::Rejected {
+      reason,
+      detail: None,
+      status,
+    },
+    Kind::Request {
+      method: _,
+      target: _,
+      target_length: _,
+      version: _,
+      status: _,
+      user_agent: _,
+      user_agent_length: _,
+      host_class: _,
+      header_count: _,
+    }
+    | Kind::Shed { reason: _ } => kind,
+  }
+}
+
 /// Reduces `address` to its network, for showing to viewers.
 ///
 /// IPv4 addresses keep their first 24 bits and IPv6 addresses their first
@@ -196,6 +234,8 @@ mod tests {
   use crate::event::Event;
   use crate::event::Kind;
   use crate::event::RejectReason;
+  use crate::event::ShedReason;
+  use crate::http::HostClass;
 
   use std::error::Error;
   use std::net::SocketAddr;
@@ -745,6 +785,27 @@ mod tests {
     Ok(())
   }
 
+  #[tokio::test]
+  async fn never_broadcasts_the_rejection_detail() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    let mut rejected = event(1);
+    rejected.kind = Kind::Rejected {
+      reason: RejectReason::Malformed,
+      detail: Some("bad target"),
+      status: Some(400),
+    };
+    let _ = tx.send(rejected);
+    drop(tx);
+
+    let written = run(rx).await?;
+
+    let payloads = payloads(&written).ok_or("not a run of text frames")?;
+    let text = String::from_utf8_lossy(payloads.first().ok_or("no frame")?);
+    assert!(text.contains(r#""reason":"malformed","detail":null"#));
+    assert!(!text.contains("bad target"));
+    Ok(())
+  }
+
   fn address(text: &str) -> Result<SocketAddr, std::net::AddrParseError> {
     text.parse()
   }
@@ -795,6 +856,68 @@ mod tests {
   fn truncate_is_unchanged_on_an_already_truncated_address() -> TestResult {
     let once = truncate_peer_address(address("203.0.113.9:51234")?);
     assert_eq!(truncate_peer_address(once), once);
+    Ok(())
+  }
+
+  /// `kind` as JSON, for comparing kinds, which do not implement
+  /// `PartialEq`.
+  fn json(kind: &Kind) -> Result<String, serde_json::Error> {
+    serde_json::to_string(kind)
+  }
+
+  #[test]
+  fn truncate_kind_removes_the_rejection_detail() -> TestResult {
+    let kind = Kind::Rejected {
+      reason: RejectReason::Malformed,
+      detail: Some("bad target"),
+      status: Some(400),
+    };
+    let expected = Kind::Rejected {
+      reason: RejectReason::Malformed,
+      detail: None,
+      status: Some(400),
+    };
+    assert_eq!(json(&truncate_kind(kind))?, json(&expected)?);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_kind_leaves_a_rejection_without_detail_unchanged() -> TestResult {
+    let kind = Kind::Rejected {
+      reason: RejectReason::Timeout,
+      detail: None,
+      status: Some(408),
+    };
+    let before = json(&kind)?;
+    assert_eq!(json(&truncate_kind(kind))?, before);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_kind_leaves_a_request_unchanged() -> TestResult {
+    let kind = Kind::Request {
+      method: "GET".to_owned(),
+      target: "/?q=1".to_owned(),
+      target_length: 5,
+      version: "HTTP/1.1".to_owned(),
+      status: 200,
+      user_agent: Some("curl/8.0".to_owned()),
+      user_agent_length: 8,
+      host_class: HostClass::Own,
+      header_count: 3,
+    };
+    let before = json(&kind)?;
+    assert_eq!(json(&truncate_kind(kind))?, before);
+    Ok(())
+  }
+
+  #[test]
+  fn truncate_kind_leaves_a_shed_unchanged() -> TestResult {
+    let kind = Kind::Shed {
+      reason: ShedReason::IpLimit,
+    };
+    let before = json(&kind)?;
+    assert_eq!(json(&truncate_kind(kind))?, before);
     Ok(())
   }
 
