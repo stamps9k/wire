@@ -26,6 +26,7 @@ use crate::http::Request;
 use crate::http::RequestError;
 use crate::http::Response;
 use crate::http::Status;
+use crate::server::IpLimit;
 use crate::server::viewer;
 use crate::site;
 
@@ -52,18 +53,20 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// One [`Event`] describing the connection is sent on `tx` after the write,
 /// whatever the outcome. `connection_id` is the number given to this
 /// connection when it was accepted. `viewer_pool` holds the slots for
-/// WebSocket viewers.
+/// WebSocket viewers, and `viewer_ip_limit` limits how many of them one
+/// client address may hold.
 ///
-/// If the response is 101 Switching Protocols, a slot is taken from
-/// `viewer_pool` before anything is written. If none is free, the response
-/// is replaced with 503 Service Unavailable and the connection is closed
-/// like any other. Otherwise, once the 101 is written successfully, the
-/// connection becomes a viewer and keeps its slot until this function
-/// returns. It subscribes to `tx` before its own event is sent, so that
-/// event is the first one it receives. Then [`viewer::stream_events`] keeps
-/// the connection open and streams every event to the client until the
-/// client goes away. Any other connection is closed when this function
-/// returns.
+/// If the response is 101 Switching Protocols, a permit is taken from
+/// `viewer_ip_limit` for the client's address and then a slot from
+/// `viewer_pool`, before anything is written; the pool is only tried if the
+/// address was under its limit. If either refuses, the response is replaced
+/// with 503 Service Unavailable and the connection is closed like any other.
+/// Otherwise, once the 101 is written successfully, the connection becomes a
+/// viewer and keeps both until this function returns. It subscribes to `tx`
+/// before its own event is sent, so that event is the first one it receives.
+/// Then [`viewer::stream_events`] keeps the connection open and streams
+/// every event to the client until the client goes away. Any other
+/// connection is closed when this function returns.
 ///
 /// # Errors
 ///
@@ -77,6 +80,7 @@ pub async fn handle(
   tx: Sender<Event>,
   connection_id: u64,
   viewer_pool: Arc<Semaphore>,
+  viewer_ip_limit: Arc<IpLimit>,
 ) -> Result<(), RequestError> {
   let start_time = SystemTime::now();
   let started = Instant::now();
@@ -84,13 +88,26 @@ pub async fn handle(
 
   let mut result = serve(&mut stream, &mut buffer).await;
 
-  // Held until handle returns, so the viewer slot stays taken while streaming.
+  // Held until handle returns, so the viewer's address permit and slot stay
+  // taken while streaming.
   let mut _viewer_permit = None;
+  let mut viewer_ip_permit = None;
   if let Ok((_, response)) = &mut result {
     if matches!(response.status, Status::SwitchingProtocols) {
-      match viewer_pool.try_acquire_owned() {
-        Ok(permit) => _viewer_permit = Some(permit),
-        Err(_) => *response = site::error_response(Status::ServiceUnavailable),
+      // First check whether the address is over its viewer limit.
+      match viewer_ip_limit.try_acquire(addr.ip()) {
+        Some(permit) => viewer_ip_permit = Some(permit),
+        None => *response = site::error_response(Status::ServiceUnavailable),
+      }
+
+      if viewer_ip_permit.is_some() {
+        // Then check whether every viewer slot is taken.
+        match viewer_pool.try_acquire_owned() {
+          Ok(permit) => _viewer_permit = Some(permit),
+          Err(_) => {
+            *response = site::error_response(Status::ServiceUnavailable);
+          }
+        }
       }
     }
   }
@@ -352,21 +369,25 @@ mod tests {
     \r\n";
 
   /// Starts `handle` on one loopback connection, as connection 1, with one
-  /// free viewer slot, and returns the client's end of it.
+  /// free viewer slot and a limit of two viewers per address, and returns
+  /// the client's end of it.
   async fn connect(tx: Sender<Event>) -> io::Result<TcpStream> {
-    connect_with(tx, Arc::new(Semaphore::new(1))).await
+    connect_with(tx, Arc::new(Semaphore::new(1)), Arc::new(IpLimit::new(2)))
+      .await
   }
 
-  /// Like [`connect`], but with the viewer slots given by `viewers`.
+  /// Like [`connect`], but with the viewer slots given by `viewers` and the
+  /// per-address viewer limit given by `viewer_ip_limit`.
   async fn connect_with(
     tx: Sender<Event>,
     viewers: Arc<Semaphore>,
+    viewer_ip_limit: Arc<IpLimit>,
   ) -> io::Result<TcpStream> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
       if let Ok((stream, peer)) = listener.accept().await {
-        let _ = handle(stream, peer, tx, 1, viewers).await;
+        let _ = handle(stream, peer, tx, 1, viewers, viewer_ip_limit).await;
       }
     });
     TcpStream::connect(address).await
@@ -576,7 +597,9 @@ mod tests {
   async fn an_upgrade_is_refused_with_503_when_no_viewer_slot_is_free()
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    let mut client =
+      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
+        .await?;
     client.write_all(UPGRADE).await?;
 
     // Reading to the end only returns once the server has closed.
@@ -591,7 +614,9 @@ mod tests {
   #[tokio::test]
   async fn a_refused_upgrade_publishes_a_503() -> TestResult {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
-    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    let mut client =
+      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
+        .await?;
     client.write_all(UPGRADE).await?;
 
     let event = timeout(Duration::from_secs(5), rx.recv()).await??;
@@ -603,7 +628,9 @@ mod tests {
   #[tokio::test]
   async fn a_plain_request_does_not_need_a_viewer_slot() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect_with(tx, Arc::new(Semaphore::new(0))).await?;
+    let mut client =
+      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
+        .await?;
     client
       .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
       .await?;
@@ -621,14 +648,16 @@ mod tests {
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
     let viewers = Arc::new(Semaphore::new(1));
+    let viewers_ip = Arc::new(IpLimit::new(2));
 
-    let mut first = connect_with(tx.clone(), viewers.clone()).await?;
+    let mut first =
+      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
     first.write_all(UPGRADE).await?;
     let head =
       timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
     assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
-    let mut second = connect_with(tx, viewers).await?;
+    let mut second = connect_with(tx, viewers, viewers_ip.clone()).await?;
     second.write_all(UPGRADE).await?;
     let mut response = Vec::new();
     timeout(Duration::from_secs(5), second.read_to_end(&mut response))
@@ -639,10 +668,66 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_second_viewer_from_one_address_is_refused_by_its_limit()
+  -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    // Plenty of slots, so only the address limit can refuse.
+    let viewers = Arc::new(Semaphore::new(2));
+    let viewers_ip = Arc::new(IpLimit::new(1));
+
+    let mut first =
+      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+    first.write_all(UPGRADE).await?;
+    let head =
+      timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
+    assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+    let mut second = connect_with(tx, viewers.clone(), viewers_ip).await?;
+    second.write_all(UPGRADE).await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), second.read_to_end(&mut response))
+      .await??;
+    assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn an_address_can_view_again_after_its_viewer_leaves() -> TestResult {
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let viewers = Arc::new(Semaphore::new(2));
+    let viewers_ip = Arc::new(IpLimit::new(1));
+
+    let mut first =
+      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+    first.write_all(UPGRADE).await?;
+    timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
+    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+    drop(first);
+
+    // The server only notices the client has gone on a write, so keep
+    // sending events and trying again until the address's permit is freed.
+    for connection_id in 100..600 {
+      let _ = tx.send(event(connection_id));
+      let mut next =
+        connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+      next.write_all(UPGRADE).await?;
+      let head = timeout(Duration::from_secs(5), read_response_head(&mut next))
+        .await??;
+      if head.starts_with("HTTP/1.1 101 Switching Protocols\r\n") {
+        return Ok(());
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the address never got a viewer again after its viewer left".into())
+  }
+
+  #[tokio::test]
   async fn a_viewer_holds_its_slot_until_the_client_has_gone() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
     let viewers = Arc::new(Semaphore::new(1));
-    let mut client = connect_with(tx.clone(), viewers.clone()).await?;
+    let viewers_ip = Arc::new(IpLimit::new(1));
+    let mut client =
+      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
     client.write_all(UPGRADE).await?;
     timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
     timeout(Duration::from_secs(10), subscribed(&tx)).await??;

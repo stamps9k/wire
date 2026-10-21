@@ -42,8 +42,20 @@ const MAX_CONNECTIONS: usize = 512;
 /// without their own limit they could hold every connection permit. A
 /// connection takes a viewer slot when its upgrade is accepted and holds it
 /// until the viewer disconnects. An upgrade that arrives when no slot is free
-/// is answered with 503 Service Unavailable.
+/// is answered with 503 Service Unavailable. Each client address may also
+/// hold at most [`MAX_VIEWERS_PER_IP`] of these slots.
 const MAX_VIEWERS: usize = 32;
+
+/// The most WebSocket viewers allowed from one client address at once.
+///
+/// Counted separately from [`MAX_IP_COUNT`], and checked before
+/// [`MAX_VIEWERS`] when an upgrade is accepted. An upgrade from an address
+/// that already has this many viewers is answered with 503 Service
+/// Unavailable, the same response as when every viewer slot is taken. A
+/// page opens one viewer, so this leaves room for a second tab or a second
+/// user behind the same address, while stopping one client from holding
+/// every slot in [`MAX_VIEWERS`].
+const MAX_VIEWERS_PER_IP: u32 = 2;
 
 /// The most connections allowed from one client address at once.
 ///
@@ -90,7 +102,8 @@ async fn main() -> io::Result<()> {
 
   let connection_pool = Arc::new(Semaphore::new(MAX_CONNECTIONS));
   let viewer_pool = Arc::new(Semaphore::new(MAX_VIEWERS));
-  let ip_limit: Arc<IpLimit> = Arc::new(IpLimit::new(MAX_IP_COUNT));
+  let connection_ip_limit = Arc::new(IpLimit::new(MAX_IP_COUNT));
+  let viewer_ip_limit = Arc::new(IpLimit::new(MAX_VIEWERS_PER_IP));
   let listener = TcpListener::bind("0.0.0.0:8080").await?;
   let (tx, mut rx) = broadcast::channel::<Event>(256);
   let mut connection_count: u64 = 0;
@@ -130,7 +143,7 @@ async fn main() -> io::Result<()> {
 
     connection_count = connection_count.wrapping_add(1);
 
-    let Some(ip_permit) = ip_limit.try_acquire(peer.ip()) else {
+    let Some(ip_permit) = connection_ip_limit.try_acquire(peer.ip()) else {
       server::shed(connection_count, peer, ShedReason::IpLimit, &tx);
       continue;
     };
@@ -142,11 +155,19 @@ async fn main() -> io::Result<()> {
 
     let tx = tx.clone();
     let viewer_pool = viewer_pool.clone();
+    let viewer_ip_limit = viewer_ip_limit.clone();
     tokio::spawn(async move {
       let _permit = permit;
       let _ip_permit = ip_permit;
-      if let Err(e) =
-        server::handle(stream, peer, tx, connection_count, viewer_pool).await
+      if let Err(e) = server::handle(
+        stream,
+        peer,
+        tx,
+        connection_count,
+        viewer_pool,
+        viewer_ip_limit,
+      )
+      .await
       {
         eprintln!("{peer}: {e}");
       }
