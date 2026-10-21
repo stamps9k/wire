@@ -29,6 +29,26 @@ use crate::websocket::OpCode;
 /// since a viewer has nothing else to send.
 const MAX_FRAME_PAYLOAD: usize = 125;
 
+/// The close code sent to a viewer when it reaches [`MAX_VIEWER_LIFE`].
+///
+/// RFC 6455 leaves codes 4000 to 4999 for applications to define, and none
+/// of the standard codes means "this connection has expired". This one
+/// means the viewer did nothing wrong and should reconnect straight away,
+/// so a client can tell this planned close apart from a failure, after
+/// which it should wait before trying again.
+const LIFETIME_CLOSE_CODE: u16 = 4000;
+
+/// The longest a viewer may stay connected.
+///
+/// The countdown starts when [`stream_events`] does and is not reset by
+/// anything the viewer sends or receives. When it ends, the viewer is sent a
+/// close with [`LIFETIME_CLOSE_CODE`] and the connection is closed, which
+/// frees its viewer slot and its address's viewer permit. A real page
+/// reconnects at once and barely notices, while a client holding slots on
+/// purpose has to keep reconnecting, which gives other clients a chance to
+/// get in and shows up in the events.
+const MAX_VIEWER_LIFE: Duration = Duration::from_secs(15 * 60);
+
 /// The longest a single write to a viewer may take.
 ///
 /// A write only waits when the socket's send buffer is full, which happens
@@ -62,13 +82,18 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// answered with a close carrying the code from [`FrameError::close_code`],
 /// which also ends the loop.
 ///
+/// Once the viewer has been connected for [`MAX_VIEWER_LIFE`], it is sent a
+/// close with [`LIFETIME_CLOSE_CODE`] and the loop ends, whatever else is
+/// happening.
+///
 /// Every write, whether an event, a pong or a close, goes through
 /// [`write_frame`], so a viewer that stops reading is dropped once a write
 /// has waited [`WRITE_TIMEOUT`].
 ///
 /// Returns `Ok(())` after a closing handshake, after the client
-/// disconnects, or when the channel closes. In the server the channel
-/// never closes while the connection holds a sender.
+/// disconnects, when the viewer reaches [`MAX_VIEWER_LIFE`], or when the
+/// channel closes. In the server the channel never closes while the
+/// connection holds a sender.
 ///
 /// # Errors
 ///
@@ -82,6 +107,9 @@ pub async fn stream_events<S>(
 where
   S: AsyncWrite + AsyncRead + Unpin,
 {
+  let deadline = tokio::time::sleep(MAX_VIEWER_LIFE);
+  tokio::pin!(deadline);
+
   let mut buffer = FrameBuffer::default();
   let mut chunk = [0u8; 1024];
   loop {
@@ -151,6 +179,13 @@ where
           // hold the thread.
           tokio::task::yield_now().await;
         }
+      },
+      () = &mut deadline => {
+        write_frame(
+          stream,
+          &Frame::close(LIFETIME_CLOSE_CODE, "connection expired").to_bytes()
+        ).await?;
+        break;
       }
     };
   }
@@ -918,6 +953,91 @@ mod tests {
     };
     let before = json(&kind)?;
     assert_eq!(json(&truncate_kind(kind))?, before);
+    Ok(())
+  }
+
+  // ---- lifetime ----
+
+  /// Splits `bytes` into the frames the server sent, as each frame's first
+  /// byte and its payload. Understands the one-byte and two-byte lengths
+  /// only. Returns `None` if a frame is masked or cut short.
+  fn frames(mut bytes: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut found = Vec::new();
+    while let [first, second, rest @ ..] = bytes {
+      let (length, rest) = match *second {
+        126 => {
+          let (size, rest) = rest.split_at_checked(2)?;
+          (usize::from(u16::from_be_bytes(size.try_into().ok()?)), rest)
+        }
+        short if short < 126 => (usize::from(short), rest),
+        _ => return None,
+      };
+      let (payload, rest) = rest.split_at_checked(length)?;
+      found.push((*first, payload));
+      bytes = rest;
+    }
+    bytes.is_empty().then_some(found)
+  }
+
+  /// Checks that the last of `frames` is a close with
+  /// [`LIFETIME_CLOSE_CODE`].
+  fn ends_with_lifetime_close(frames: &[(u8, &[u8])]) -> bool {
+    frames.last().is_some_and(|(first, payload)| {
+      *first == 0x88 && payload.starts_with(&LIFETIME_CLOSE_CODE.to_be_bytes())
+    })
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_silent_viewer_is_closed_once_its_lifetime_passes() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (mut server, mut client) = tokio::io::duplex(65_536);
+    let started = tokio::time::Instant::now();
+    let viewer =
+      tokio::spawn(async move { stream_events(&mut server, rx).await });
+
+    // The clock is paused and jumps ahead whenever every task is waiting,
+    // so this runs at once. The pipe closes when the viewer's task ends.
+    let mut written = Vec::new();
+    timeout(MAX_VIEWER_LIFE * 2, client.read_to_end(&mut written)).await??;
+
+    assert!(started.elapsed() >= MAX_VIEWER_LIFE);
+    let frames = frames(&written).ok_or("not a run of server frames")?;
+    assert!(ends_with_lifetime_close(&frames));
+    assert!(viewer.await?.is_ok());
+    drop(tx);
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_busy_viewer_is_still_closed_on_time() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (mut server, mut client) = tokio::io::duplex(65_536);
+    let started = tokio::time::Instant::now();
+    let viewer =
+      tokio::spawn(async move { stream_events(&mut server, rx).await });
+    // An event every minute for twice the lifetime. If activity reset the
+    // countdown, the viewer would outlive the sender, and the closed
+    // channel would end it without the lifetime close.
+    let minutes = MAX_VIEWER_LIFE.as_secs().div_ceil(60).saturating_mul(2);
+    let sender = tokio::spawn(async move {
+      for connection_id in 0..minutes {
+        let _ = tx.send(event(connection_id));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+      }
+    });
+
+    let mut written = Vec::new();
+    timeout(MAX_VIEWER_LIFE * 4, client.read_to_end(&mut written)).await??;
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= MAX_VIEWER_LIFE);
+    assert!(elapsed < MAX_VIEWER_LIFE + Duration::from_secs(60));
+    let frames = frames(&written).ok_or("not a run of server frames")?;
+    let events = frames.iter().filter(|(first, _)| *first == 0x81).count();
+    assert!(events > 1, "only {events} events reached the viewer");
+    assert!(ends_with_lifetime_close(&frames));
+    assert!(viewer.await?.is_ok());
+    sender.abort();
     Ok(())
   }
 
