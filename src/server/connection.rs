@@ -10,6 +10,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -41,10 +42,22 @@ use crate::site;
 /// Timeout and the event is rejected with reason `timeout`.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The longest writing a response to a client may take.
+///
+/// A write only waits when the socket's send buffer is full, which happens
+/// when the client has stopped reading. Without this limit, a client that
+/// sends a request and then never reads could hold its connection permit
+/// and address slot forever. The largest response is a few tens of
+/// kilobytes, which a real client receives well within this, even on a slow
+/// link. It matches the viewers' write timeout, which covers every write
+/// once a connection has been upgraded.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Serves one client connection from start to finish.
 ///
 /// Calls `serve` to read the request and decide the response, then writes
-/// that response.
+/// that response with [`write_response`], which gives up after
+/// [`RESPONSE_TIMEOUT`].
 ///
 /// If the request fails, the error is mapped to a status with
 /// [`RequestError::status`] and an error page is sent. Errors with no status,
@@ -72,8 +85,8 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Returns the [`RequestError`] from reading, parsing or validating the
 /// request, after any error response has been written. Returns
-/// [`RequestError::Io`] if writing the response fails, or if reading from or
-/// writing to a viewer fails.
+/// [`RequestError::Io`] if writing the response fails or takes longer than
+/// [`RESPONSE_TIMEOUT`], or if reading from or writing to a viewer fails.
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
@@ -118,7 +131,7 @@ pub async fn handle(
   };
 
   let written = match &bytes {
-    Some(bytes) => stream.write_all(bytes).await,
+    Some(bytes) => write_response(&mut stream, bytes).await,
     None => Ok(()),
   };
 
@@ -147,6 +160,22 @@ pub async fn handle(
   }
 
   result.map(|_| ())
+}
+
+/// Writes `bytes` to `stream`, giving up after [`RESPONSE_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns an error of kind [`TimedOut`](io::ErrorKind::TimedOut) if the
+/// write does not finish in time, or the error from the write itself.
+async fn write_response<S>(
+  stream: &mut S,
+  bytes: &[u8],
+) -> Result<(), io::Error>
+where
+  S: AsyncWrite + Unpin,
+{
+  timeout(RESPONSE_TIMEOUT, stream.write_all(bytes)).await?
 }
 
 /// Reads one request from `stream` and decides the response.
@@ -490,6 +519,46 @@ mod tests {
         status: Some(408),
       }
     ));
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_response_write_gives_up_on_a_client_that_stops_reading()
+  -> TestResult {
+    // The pipe holds less than the response, so the write blocks. The
+    // client end must stay alive (not `_`), or the write fails at once
+    // instead of blocking.
+    let (mut server, _client) = tokio::io::duplex(64);
+    let started = tokio::time::Instant::now();
+
+    let result = timeout(
+      RESPONSE_TIMEOUT * 2,
+      write_response(&mut server, &[0; 1024]),
+    )
+    .await?;
+
+    let error = result.err().ok_or("write_response returned Ok")?;
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= RESPONSE_TIMEOUT);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_response_write_delivers_everything_to_a_reading_client()
+  -> TestResult {
+    // The same small pipe, but the client keeps reading, so the write
+    // finishes however many times it has to wait for room.
+    let (mut server, mut client) = tokio::io::duplex(64);
+    let bytes = vec![7_u8; 1024];
+    let reader = tokio::spawn(async move {
+      let mut received = Vec::new();
+      client.read_to_end(&mut received).await.map(|_| received)
+    });
+
+    write_response(&mut server, &bytes).await?;
+    drop(server);
+
+    assert_eq!(timeout(Duration::from_secs(5), reader).await???, bytes);
     Ok(())
   }
 
