@@ -29,11 +29,24 @@ impl Response {
     }
   }
 
+  /// Adds a header named `name` with `value` to the extra headers, and
+  /// returns the response so that calls can be chained.
+  ///
+  /// The name is written as given and the value as raw bytes, so both must
+  /// already be valid for a header field; nothing is checked here.
+  pub fn with_header(mut self, name: String, value: Vec<u8>) -> Response {
+    self.headers.push(Header { name, value });
+    self
+  }
+
   /// Serialises the response as it is sent on the wire.
   ///
-  /// Writes the status line, the `Content-Type`, `Content-Length` and
-  /// `Connection: close` headers, then the extra headers in order, a blank
-  /// line, and the body. `Content-Length` is the body's length in bytes.
+  /// Writes the status line, the `Content-Type`, `Content-Length`,
+  /// `Connection: close` and `X-Content-Type-Options: nosniff` headers, then
+  /// the extra headers in order, a blank line, and the body.
+  /// `Content-Length` is the body's length in bytes. `nosniff` tells the
+  /// browser to trust the `Content-Type`, so a page can never be loaded as a
+  /// script or a stylesheet by another site.
   ///
   /// A 101 response is the exception: it gets only the status line, the
   /// extra headers and the blank line. The fixed headers and the body are
@@ -64,6 +77,7 @@ impl Response {
         Content-Type: text/html; charset=utf-8\r\n\
         Content-Length: {}\r\n\
         Connection: close\r\n\
+        X-Content-Type-Options: nosniff\r\n\
         {headers}\
         \r\n",
         self.status.code(),
@@ -103,6 +117,24 @@ mod tests {
   }
 
   #[test]
+  fn with_header_adds_headers_in_order_and_keeps_the_rest() {
+    let response = Response::new(Status::NotFound, b"gone".to_vec())
+      .with_header("X-First".to_owned(), b"1".to_vec())
+      .with_header("X-Second".to_owned(), b"2".to_vec());
+    assert!(matches!(response.status, Status::NotFound));
+    assert_eq!(response.body, b"gone");
+    let names: Vec<&str> =
+      response.headers.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names, ["X-First", "X-Second"]);
+    let values: Vec<&[u8]> = response
+      .headers
+      .iter()
+      .map(|h| h.value.as_slice())
+      .collect();
+    assert_eq!(values, [b"1".as_slice(), b"2".as_slice()]);
+  }
+
+  #[test]
   fn to_bytes_writes_head_then_body() {
     let response = Response {
       status: Status::Ok,
@@ -116,6 +148,7 @@ mod tests {
        Content-Type: text/html; charset=utf-8\r\n\
        Content-Length: 5\r\n\
        Connection: close\r\n\
+       X-Content-Type-Options: nosniff\r\n\
        \r\n\
        hello"
     );
@@ -157,6 +190,7 @@ mod tests {
        Content-Type: text/html; charset=utf-8\r\n\
        Content-Length: 2\r\n\
        Connection: close\r\n\
+       X-Content-Type-Options: nosniff\r\n\
        Allow: GET\r\n\
        \r\n\
        hi"

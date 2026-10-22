@@ -1,7 +1,6 @@
 //! Routing: decides the response for a valid request, and builds error
 //! responses with the error page as their body.
 
-use crate::http::Header;
 use crate::http::Method;
 use crate::http::Request;
 use crate::http::Response;
@@ -31,6 +30,33 @@ const ALLOWED_ORIGINS: &[&str] = &[
   "http://localhost:8080",
 ];
 
+/// The Content-Security-Policy for the index and error pages, which use no
+/// scripts, styles or other resources.
+///
+/// `default-src 'none'` lets the page load and run nothing, so even text
+/// from a request that reached the page unescaped could not run.
+/// `frame-ancestors 'none'` stops other sites showing the page in a frame,
+/// and `base-uri 'none'` and `form-action 'none'` cover the two things
+/// `default-src` does not: changing the base URL and submitting forms.
+const STRICT_CSP: &str = "default-src 'none'; \
+  frame-ancestors 'none'; \
+  base-uri 'none'; \
+  form-action 'none'";
+
+/// The Content-Security-Policy for the debug page.
+///
+/// The same as [`STRICT_CSP`], except that the page may run its own inline
+/// script and style and open connections back to this server, which it
+/// needs for the WebSocket. Inline code is allowed because the page is
+/// static and never contains anything from a request.
+const DEBUG_CSP: &str = "script-src 'unsafe-inline'; \
+  style-src 'unsafe-inline'; \
+  connect-src 'self'; \
+  default-src 'none'; \
+  frame-ancestors 'none'; \
+  base-uri 'none'; \
+  form-action 'none'";
+
 /// Chooses the response for `request`.
 ///
 /// The method is checked first, then the path. Any method other than `GET`
@@ -41,16 +67,15 @@ const ALLOWED_ORIGINS: &[&str] = &[
 /// [`websocket::upgrade`]. Everything else gets 404, including targets that
 /// are not in origin form.
 ///
+/// The debug page carries [`DEBUG_CSP`] as its Content-Security-Policy, and
+/// every other page, including error pages, carries [`STRICT_CSP`].
+///
 /// The request must already have passed [`Request::validate`]. This function
 /// reads nothing from the connection and cannot fail.
 pub fn route(request: &Request) -> Response {
   if !matches!(request.method, Method::Get) {
-    let mut response = error_response(Status::MethodNotAllowed);
-    response.headers.push(Header {
-      name: "Allow".to_string(),
-      value: b"GET".to_vec(),
-    });
-    return response;
+    return error_response(Status::MethodNotAllowed)
+      .with_header("Allow".into(), "GET".into());
   }
 
   let Target::Origin(target) = &request.target else {
@@ -60,8 +85,10 @@ pub fn route(request: &Request) -> Response {
   let resource = target.split('?').next();
 
   match resource {
-    Some("/") => Response::ok(site::index(request)),
-    Some("/debug") => Response::ok(site::debug()),
+    Some("/") => Response::ok(site::index(request))
+      .with_header("Content-Security-Policy".into(), STRICT_CSP.into()),
+    Some("/debug") => Response::ok(site::debug())
+      .with_header("Content-Security-Policy".into(), DEBUG_CSP.into()),
     Some("/ws") => {
       let Some(origin) = request.header("origin") else {
         return error_response(Status::Forbidden);
@@ -77,14 +104,17 @@ pub fn route(request: &Request) -> Response {
   }
 }
 
-/// Builds the response for `status` with the error page as its body.
+/// Builds the response for `status` with the error page as its body and
+/// [`STRICT_CSP`] as its Content-Security-Policy.
 pub fn error_response(status: Status) -> Response {
   Response::new(status, site::error(status))
+    .with_header("Content-Security-Policy".into(), STRICT_CSP.into())
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::http::Header;
   use crate::http::Version;
 
   fn request(method: Method, target: Target) -> Request {
@@ -137,6 +167,16 @@ mod tests {
 
   fn upgrade_code(value: Option<&[u8]>) -> u16 {
     route(&upgrade_request(value)).status.code()
+  }
+
+  /// The values of every Content-Security-Policy header in `response`.
+  fn policies(response: &Response) -> Vec<&[u8]> {
+    response
+      .headers
+      .iter()
+      .filter(|h| h.name.eq_ignore_ascii_case("content-security-policy"))
+      .map(|h| h.value.as_slice())
+      .collect()
   }
 
   #[test]
@@ -205,17 +245,75 @@ mod tests {
   #[test]
   fn not_allowed_lists_get_in_allow() {
     let response = route(&request(Method::Post, origin("/")));
-    assert_eq!(response.headers.len(), 1);
-    let header = response.headers.first();
-    assert!(header.is_some_and(|h| h.name == "Allow" && h.value == b"GET"));
+    assert_eq!(response.headers.len(), 2);
+    let allow = response.headers.iter().find(|h| h.name == "Allow");
+    assert!(allow.is_some_and(|h| h.value == b"GET"));
+    assert_eq!(policies(&response), [STRICT_CSP.as_bytes()]);
   }
 
   #[test]
-  fn other_responses_have_no_extra_headers() {
+  fn other_responses_have_only_their_policy() {
     let found = route(&request(Method::Get, origin("/")));
     let missing = route(&request(Method::Get, origin("/nope")));
-    assert!(found.headers.is_empty());
-    assert!(missing.headers.is_empty());
+    assert_eq!(found.headers.len(), 1);
+    assert_eq!(policies(&found), [STRICT_CSP.as_bytes()]);
+    assert_eq!(missing.headers.len(), 1);
+    assert_eq!(policies(&missing), [STRICT_CSP.as_bytes()]);
+  }
+
+  #[test]
+  fn every_error_page_carries_the_strict_policy() {
+    let site = b"http://wire.stampatron.com";
+    let responses = [
+      route(&request(Method::Get, origin("/nope"))),
+      route(&request(Method::Post, origin("/"))),
+      route(&request(Method::Get, origin("/ws"))),
+      route(&from_origin(origin("/ws"), site)),
+      error_response(Status::RequestTimeout),
+      error_response(Status::ServiceUnavailable),
+    ];
+    for response in &responses {
+      let code = response.status.code();
+      assert_eq!(policies(response), [STRICT_CSP.as_bytes()], "{code}");
+    }
+  }
+
+  #[test]
+  fn an_accepted_upgrade_has_no_policy() {
+    let response = route(&upgrade_request(Some(b"http://wire.stampatron.com")));
+    assert_eq!(response.status.code(), 101);
+    assert!(policies(&response).is_empty());
+  }
+
+  #[test]
+  fn each_policy_is_a_list_of_directives_with_quoted_sources() {
+    // Every source in these policies is a quoted keyword, so a bare word
+    // after a directive's name means a semicolon is missing and two
+    // directives have run together.
+    for policy in [STRICT_CSP, DEBUG_CSP] {
+      let mut names = Vec::new();
+      for directive in policy.split(';') {
+        let mut words = directive.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        assert!(
+          name.ends_with("-src")
+            || name.ends_with("-uri")
+            || name.ends_with("-ancestors")
+            || name.ends_with("-action"),
+          "unexpected directive {name:?} in {policy:?}"
+        );
+        assert!(
+          words.all(|w| w.starts_with('\'') && w.ends_with('\'')),
+          "unquoted source in {directive:?}"
+        );
+        assert!(!names.contains(&name), "{name} repeated in {policy:?}");
+        names.push(name);
+      }
+      assert!(names.contains(&"default-src"), "{policy:?}");
+    }
+    assert!(STRICT_CSP.contains("default-src 'none'"));
+    assert!(DEBUG_CSP.contains("default-src 'none'"));
+    assert!(DEBUG_CSP.contains("connect-src 'self'"));
   }
 
   #[test]
@@ -286,7 +384,8 @@ mod tests {
   fn get_debug_serves_the_debug_page() {
     let response = route(&request(Method::Get, origin("/debug")));
     assert_eq!(response.status.code(), 200);
-    assert!(response.headers.is_empty());
+    assert_eq!(response.headers.len(), 1);
+    assert_eq!(policies(&response), [DEBUG_CSP.as_bytes()]);
     let body = String::from_utf8_lossy(&response.body);
     assert!(body.contains("<title>wire debug</title>"));
   }
