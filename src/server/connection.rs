@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -53,6 +54,20 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// once a connection has been upgraded.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest [`lingering_close`] waits for a client to close its side.
+///
+/// A client that has read its response normally closes within milliseconds,
+/// so this only matters for one that never does. Until it passes, the
+/// connection keeps its permit and its address's slot, so it is kept short.
+const LINGER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The most bytes [`lingering_close`] reads and discards before giving up.
+///
+/// Enough for a request body or a pipelined request that arrived after the
+/// response was decided. A client still sending past this is not going to
+/// stop, so the connection is closed without waiting for it.
+const LINGER_CAP: usize = 64 * 1024;
+
 /// Serves one client connection from start to finish.
 ///
 /// Calls `serve` to read the request and decide the response, then writes
@@ -79,7 +94,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// before its own event is sent, so that event is the first one it receives.
 /// Then [`viewer::stream_events`] keeps the connection open and streams
 /// every event to the client until the client goes away. Any other
-/// connection is closed when this function returns.
+/// connection is closed with [`lingering_close`] before this function
+/// returns, so the client can read the whole response.
 ///
 /// # Errors
 ///
@@ -157,9 +173,48 @@ pub async fn handle(
 
   if let Some(rx) = viewer {
     viewer::stream_events(&mut stream, rx).await?;
+  } else {
+    lingering_close(&mut stream).await;
   }
 
   result.map(|_| ())
+}
+
+/// Closes the client's connection without losing the response just written.
+///
+/// Closing a socket that still holds unread data from the client makes the
+/// kernel send a reset instead of a normal close, and a reset can make the
+/// client discard the response before reading it. This happens when a
+/// request is refused before all of it has been read, such as a head that
+/// is too large or a body the server never reads.
+///
+/// So the sending side is shut down first, which tells the client no more
+/// data is coming, and then whatever the client still sends is read and
+/// discarded until it closes its side. Reading stops early on an error,
+/// after [`LINGER_CAP`] bytes, or when [`LINGER_TIMEOUT`] passes. The
+/// connection is closed when the caller drops `stream`. Nothing is
+/// returned, because by this point there is nothing left to report.
+async fn lingering_close<S>(stream: &mut S)
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let _ = timeout(LINGER_TIMEOUT, async {
+    let _ = stream.shutdown().await;
+    let mut chunk = [0u8; 1024];
+    let mut total: usize = 0;
+    loop {
+      let Ok(read) = stream.read(&mut chunk).await else {
+        return;
+      };
+
+      total = total.saturating_add(read);
+
+      if read == 0 || total >= LINGER_CAP {
+        return;
+      }
+    }
+  })
+  .await;
 }
 
 /// Writes `bytes` to `stream`, giving up after [`RESPONSE_TIMEOUT`].
@@ -559,6 +614,77 @@ mod tests {
     drop(server);
 
     assert_eq!(timeout(Duration::from_secs(5), reader).await???, bytes);
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn lingering_close_returns_once_the_client_closes() -> TestResult {
+    let (mut server, mut client) = tokio::io::duplex(64);
+    // The client reads until the server's side is shut down, then closes.
+    // If the shutdown never came, it would never close, and lingering_close
+    // would only return at the deadline.
+    let closer = tokio::spawn(async move {
+      let mut rest = Vec::new();
+      client.read_to_end(&mut rest).await
+    });
+    let started = tokio::time::Instant::now();
+
+    lingering_close(&mut server).await;
+
+    assert!(started.elapsed() < LINGER_TIMEOUT);
+    timeout(Duration::from_secs(5), closer).await???;
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn lingering_close_drains_what_the_client_still_sends() -> TestResult {
+    let (mut server, mut client) = tokio::io::duplex(64);
+    // More than the pipe holds, so the client can only finish sending and
+    // close if lingering_close keeps reading.
+    let sender =
+      tokio::spawn(async move { client.write_all(&[1; 4096]).await });
+    let started = tokio::time::Instant::now();
+
+    lingering_close(&mut server).await;
+
+    assert!(started.elapsed() < LINGER_TIMEOUT);
+    timeout(Duration::from_secs(5), sender).await???;
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn lingering_close_gives_up_on_a_silent_client() -> TestResult {
+    // The client end must stay alive (not `_`), or the read ends at once.
+    let (mut server, _client) = tokio::io::duplex(64);
+    let started = tokio::time::Instant::now();
+
+    timeout(LINGER_TIMEOUT * 2, lingering_close(&mut server)).await?;
+
+    assert!(started.elapsed() >= LINGER_TIMEOUT);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn lingering_close_stops_reading_at_the_cap() -> TestResult {
+    // Real time, because a client that never stops sending keeps both tasks
+    // busy, and a paused clock only moves when every task is waiting.
+    let (mut server, mut client) = tokio::io::duplex(64);
+    let flooder = tokio::spawn(async move {
+      let mut sent: usize = 0;
+      while client.write_all(&[2; 1024]).await.is_ok() {
+        sent = sent.saturating_add(1024);
+      }
+      sent
+    });
+    let started = std::time::Instant::now();
+
+    lingering_close(&mut server).await;
+    let elapsed = started.elapsed();
+    drop(server);
+
+    assert!(elapsed < LINGER_TIMEOUT, "took {elapsed:?}");
+    let sent = timeout(Duration::from_secs(5), flooder).await??;
+    assert!(sent >= LINGER_CAP, "only {sent} bytes were read");
     Ok(())
   }
 
