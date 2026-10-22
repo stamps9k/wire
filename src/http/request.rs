@@ -99,6 +99,18 @@ impl Request {
     Ok(())
   }
 
+  /// Returns the first header field named `name`, or `None` if there is
+  /// none.
+  ///
+  /// Field names are compared without regard to ASCII case, as HTTP
+  /// requires, so `"Origin"` and `"origin"` find the same field.
+  pub fn header(&self, name: &str) -> Option<&Header> {
+    self
+      .headers
+      .iter()
+      .find(|h| name.eq_ignore_ascii_case(&h.name))
+  }
+
   /// Checks the number of Host headers (RFC 9112 section 3.2).
   ///
   /// An HTTP/1.0 request may omit Host. Every other version needs exactly
@@ -207,6 +219,35 @@ mod tests {
 
   fn pair(name: &str, value: &[u8]) -> (String, Vec<u8>) {
     (name.to_owned(), value.to_vec())
+  }
+
+  /// Parses `raw` and returns the value [`Request::header`] finds for
+  /// `name`, or `None` if parsing fails or there is no such field.
+  fn value_of(raw: &[u8], name: &str) -> Option<Vec<u8>> {
+    Request::parse(raw)
+      .ok()?
+      .header(name)
+      .map(|h| h.value.clone())
+  }
+
+  #[test]
+  fn header_finds_a_field_whatever_the_case_of_the_name() {
+    let raw = b"GET / HTTP/1.1\r\nHost: a\r\nOrigin: http://x\r\n\r\n";
+    assert_eq!(value_of(raw, "origin"), Some(b"http://x".to_vec()));
+    assert_eq!(value_of(raw, "Origin"), Some(b"http://x".to_vec()));
+    assert_eq!(value_of(raw, "ORIGIN"), Some(b"http://x".to_vec()));
+  }
+
+  #[test]
+  fn header_returns_the_first_of_duplicate_fields() {
+    let raw = b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
+    assert_eq!(value_of(raw, "host"), Some(b"a".to_vec()));
+  }
+
+  #[test]
+  fn header_is_none_when_the_field_is_absent() {
+    let raw = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    assert_eq!(value_of(raw, "origin"), None);
   }
 
   #[test]

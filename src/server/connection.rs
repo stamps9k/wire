@@ -362,6 +362,7 @@ mod tests {
 
   const UPGRADE: &[u8] = b"GET /ws HTTP/1.1\r\n\
     Host: wire.stampatron.com\r\n\
+    Origin: http://wire.stampatron.com\r\n\
     Upgrade: websocket\r\n\
     Connection: Upgrade\r\n\
     Sec-WebSocket-Version: 13\r\n\
@@ -516,7 +517,10 @@ mod tests {
     let (tx, _) = broadcast::channel::<Event>(16);
     let mut client = connect(tx).await?;
     client
-      .write_all(b"GET /ws HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .write_all(
+        b"GET /ws HTTP/1.1\r\nHost: wire.stampatron.com\r\n\
+          Origin: http://wire.stampatron.com\r\n\r\n",
+      )
       .await?;
 
     let mut response = Vec::new();
