@@ -13,6 +13,19 @@ use crate::http::Version;
 use crate::site::html::escape;
 use crate::site::html::render;
 
+/// Request headers whose values the index page never shows, because they
+/// carry credentials.
+///
+/// The page is served over plain HTTP on a subdomain of stampatron.com, so
+/// a browser can send it cookies set for the whole domain. Echoing them
+/// would put session values into a page anyone on the path can read. Each
+/// of these headers is still listed, with its value replaced by its length.
+///
+/// Names must be lowercase, because the parser lowercases every header
+/// name before the page sees it.
+const REDACTED_HEADERS: &[&str] =
+  &["authorization", "cookie", "proxy-authorization"];
+
 /// Renders every page that is built from a template, and discards the
 /// result.
 ///
@@ -45,7 +58,9 @@ pub fn validate_templates() {
 /// the order they were received. Every value comes from the client, so each
 /// one is HTML-escaped with [`escape`] before it is inserted into
 /// `public/index.html`. Header values are raw bytes, so any that are not
-/// valid UTF-8 are shown with replacement characters.
+/// valid UTF-8 are shown with replacement characters. The value of any
+/// header in [`REDACTED_HEADERS`] is never shown: the header is listed as
+/// `[redacted, N bytes]` instead.
 ///
 /// # Panics
 ///
@@ -58,12 +73,22 @@ pub fn index(request: &Request) -> Vec<u8> {
   let mut headers = String::new();
   for header in &request.headers {
     // Writing to a `String` cannot fail, so the result is discarded.
-    let _ = write!(
-      headers,
-      "<li>{}: {}</li>",
-      escape(&header.name),
-      escape(&String::from_utf8_lossy(&header.value))
-    );
+    if REDACTED_HEADERS.contains(&header.name.as_str()) {
+      // Never show credentials
+      let _ = write!(
+        headers,
+        "<li>{}: [redacted, {} bytes]</li>",
+        escape(&header.name),
+        header.value.len()
+      );
+    } else {
+      let _ = write!(
+        headers,
+        "<li>{}: {}</li>",
+        escape(&header.name),
+        escape(&String::from_utf8_lossy(&header.value))
+      );
+    }
   }
 
   let template = include_str!("../../public/index.html");
@@ -112,6 +137,7 @@ mod tests {
   use super::*;
   use crate::http::Header;
   use crate::http::Method;
+  use crate::http::RequestError;
   use crate::http::Target;
   use crate::http::Version;
 
@@ -215,6 +241,70 @@ mod tests {
   fn index_shows_an_empty_header_value() {
     let body = index_text(&request(vec![header("x-empty", b"")]));
     assert!(body.contains("<li>x-empty: </li>"));
+  }
+
+  #[test]
+  fn index_redacts_the_value_of_every_credential_header() {
+    for name in ["authorization", "cookie", "proxy-authorization"] {
+      let body = index_text(&request(vec![header(name, b"secret-value")]));
+      assert!(
+        body.contains(&format!("<li>{name}: [redacted, 12 bytes]</li>")),
+        "{name} was not redacted"
+      );
+      assert!(!body.contains("secret-value"), "{name} value was shown");
+    }
+  }
+
+  #[test]
+  fn index_redacts_credentials_whatever_case_they_were_sent_in()
+  -> Result<(), RequestError> {
+    // The parser lowercases names, so the page only has to match lowercase.
+    let headers = vec![
+      Header::parse(b"COOKIE: session=abc")?,
+      Header::parse(b"Authorization: Bearer xyz")?,
+    ];
+    let body = index_text(&request(headers));
+    assert!(body.contains("<li>cookie: [redacted, 11 bytes]</li>"));
+    assert!(body.contains("<li>authorization: [redacted, 10 bytes]</li>"));
+    assert!(!body.contains("session=abc"));
+    assert!(!body.contains("Bearer xyz"));
+    Ok(())
+  }
+
+  #[test]
+  fn index_counts_the_bytes_of_a_redacted_value() {
+    let empty = index_text(&request(vec![header("cookie", b"")]));
+    assert!(empty.contains("<li>cookie: [redacted, 0 bytes]</li>"));
+    let raw = index_text(&request(vec![header("cookie", b"a\xffb")]));
+    assert!(raw.contains("<li>cookie: [redacted, 3 bytes]</li>"));
+  }
+
+  #[test]
+  fn index_shows_other_headers_in_full_around_a_redacted_one() {
+    let headers = vec![
+      header("host", b"example.com"),
+      header("cookie", b"session=abc"),
+      header("accept", b"*/*"),
+    ];
+    let body = index_text(&request(headers));
+    assert!(body.contains(
+      "<ul><li>host: example.com</li>\
+       <li>cookie: [redacted, 11 bytes]</li>\
+       <li>accept: */*</li></ul>"
+    ));
+  }
+
+  #[test]
+  fn index_only_redacts_exact_header_names() {
+    let headers = vec![
+      header("x-cookie", b"shown"),
+      header("cookies", b"also shown"),
+      header("authorization-hint", b"visible"),
+    ];
+    let body = index_text(&request(headers));
+    assert!(body.contains("<li>x-cookie: shown</li>"));
+    assert!(body.contains("<li>cookies: also shown</li>"));
+    assert!(body.contains("<li>authorization-hint: visible</li>"));
   }
 
   #[test]
