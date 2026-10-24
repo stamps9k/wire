@@ -1,13 +1,10 @@
 //! WebSocket viewers: after a successful upgrade, a connection subscribes to
-//! the event channel and receives every event as a text frame of JSON, while
+//! the viewer feed and writes every message it receives to the client, while
 //! the frames the client sends are read and answered, until either side ends
 //! the connection.
 
 use std::io::Error;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
-use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncRead;
@@ -18,8 +15,6 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
-use crate::event::Event;
-use crate::event::Kind;
 use crate::websocket::Frame;
 use crate::websocket::FrameBuffer;
 use crate::websocket::FrameError;
@@ -58,18 +53,15 @@ const MAX_VIEWER_LIFE: Duration = Duration::from_secs(15 * 60);
 /// A healthy client, even a slow one, finishes each write well within it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Streams events to a WebSocket viewer and answers the frames it sends,
-/// until either side ends the connection.
+/// Writes the viewer feed to a WebSocket viewer and answers the frames it
+/// sends, until either side ends the connection.
 ///
-/// Each event received on `rx` is serialised to JSON and written to
-/// `stream` as one text frame (see [`Frame::text`] and [`Frame::to_bytes`]).
-/// Before serialising, the peer address is reduced to its network with
-/// [`truncate_peer_address`], so a viewer never sees a client's full address,
-/// and the detail of a rejection is removed with [`truncate_kind`]. Standard
-/// output still gets the full event. Only events sent after `rx` was subscribed
-/// are seen. If the viewer falls behind and the channel drops events, the
-/// missed ones are skipped and streaming carries on with the next. An event
-/// that cannot be serialised is skipped.
+/// Each message received on `rx` is a finished text frame from the viewer
+/// feed (see [`run_viewer_feed`](crate::server::run_viewer_feed)), already
+/// trimmed for viewers, and is written to `stream` as it is. Only messages
+/// sent after `rx` was subscribed are seen. If the viewer falls behind and
+/// the channel drops messages, the missed ones are skipped and writing
+/// carries on with the next.
 ///
 /// At the same time, bytes from the client are collected in a
 /// [`FrameBuffer`] and taken from it one frame at a time, with a payload cap
@@ -92,8 +84,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Returns `Ok(())` after a closing handshake, after the client
 /// disconnects, when the viewer reaches [`MAX_VIEWER_LIFE`], or when the
-/// channel closes. In the server the channel never closes while the
-/// connection holds a sender.
+/// feed closes. In the server the feed never closes, because `main` holds
+/// a sender for as long as it runs.
 ///
 /// # Errors
 ///
@@ -102,7 +94,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// failed read or write on `stream`.
 pub async fn stream_events<S>(
   stream: &mut S,
-  mut rx: Receiver<Event>,
+  mut rx: Receiver<Arc<[u8]>>,
 ) -> Result<(), Error>
 where
   S: AsyncWrite + AsyncRead + Unpin,
@@ -115,18 +107,12 @@ where
   loop {
     tokio::select! {
       result = rx.recv() => {
-        let mut event = match result {
+        let frame = match result {
           Ok(v) => v,
           Err(RecvError::Lagged(_)) => continue,
           Err(RecvError::Closed) => break,
         };
-        event.peer_address = truncate_peer_address(event.peer_address);
-        event.kind = truncate_kind(event.kind);
-        let Ok(event_s) = serde_json::to_string(&event) else {
-          continue;
-        };
-        let bytes = Frame::text(event_s.as_bytes()).to_bytes();
-        write_frame(stream, &bytes).await?;
+        write_frame(stream, &frame).await?;
       },
       result = stream.read(&mut chunk) => {
         let size = result?;
@@ -193,63 +179,6 @@ where
   Ok(())
 }
 
-/// Removes from `kind` what viewers should not see.
-///
-/// A rejection's `detail`, which names the parser check that failed, is set
-/// to `None`, so watching the stream does not reveal what the generic 400
-/// response hides. The field stays in the JSON as `null`, so every event of
-/// a kind has the same shape. Every other variant is returned unchanged.
-///
-/// Every variant and field is named in the match, so a new one does not
-/// compile until it has been decided here what viewers may see of it.
-fn truncate_kind(kind: Kind) -> Kind {
-  match kind {
-    Kind::Rejected {
-      reason,
-      detail: _,
-      status,
-    } => Kind::Rejected {
-      reason,
-      detail: None,
-      status,
-    },
-    Kind::Request {
-      method: _,
-      target: _,
-      target_length: _,
-      version: _,
-      status: _,
-      user_agent: _,
-      user_agent_length: _,
-      host_class: _,
-      header_count: _,
-    }
-    | Kind::Shed { reason: _ } => kind,
-  }
-}
-
-/// Reduces `address` to its network, for showing to viewers.
-///
-/// IPv4 addresses keep their first 24 bits and IPv6 addresses their first
-/// 48. The port is set to 0. An IPv4-mapped IPv6 address is first turned
-/// back into IPv4, so it is cut to a /24 and does not keep the whole IPv4
-/// address inside a /48.
-///
-/// Viewers see a JSON string like `203.0.113.0:0` or `[2001:db8:abcd::]:0`,
-/// which should be read as the /24 or /48 network.
-fn truncate_peer_address(address: SocketAddr) -> SocketAddr {
-  let masked_ip = match address.ip().to_canonical() {
-    IpAddr::V4(v4) => {
-      IpAddr::V4(Ipv4Addr::from_bits(v4.to_bits() & 0xFFFF_FF00))
-    }
-    IpAddr::V6(v6) => {
-      IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & (!0u128 << 80)))
-    }
-  };
-
-  SocketAddr::new(masked_ip, 0)
-}
-
 /// Writes `bytes` to `stream`, giving up after [`WRITE_TIMEOUT`].
 ///
 /// # Errors
@@ -269,12 +198,9 @@ mod tests {
   use crate::event::Event;
   use crate::event::Kind;
   use crate::event::RejectReason;
-  use crate::event::ShedReason;
-  use crate::http::HostClass;
 
   use std::error::Error;
   use std::net::SocketAddr;
-  use std::sync::Arc;
   use std::sync::atomic::AtomicUsize;
   use std::sync::atomic::Ordering;
   use std::time::Duration;
@@ -317,6 +243,14 @@ mod tests {
     }
   }
 
+  /// The finished frame the viewer feed would send for [`event`] with
+  /// `connection_id`: a text frame of its JSON. Its connection id can be
+  /// read back with [`id`] or [`ids`].
+  fn message(connection_id: u64) -> Arc<[u8]> {
+    let json = serde_json::to_string(&event(connection_id)).unwrap_or_default();
+    Arc::from(Frame::text(json.as_bytes()).to_bytes())
+  }
+
   /// Splits `bytes` into the payloads of the frames it holds.
   ///
   /// Understands the one-byte and two-byte lengths only. Returns `None` if
@@ -356,7 +290,7 @@ mod tests {
   ///
   /// The client end stays open and silent the whole time, so only the
   /// channel closing (or a failure) can end the loop.
-  async fn run(rx: Receiver<Event>) -> Result<Vec<u8>, Box<dyn Error>> {
+  async fn run(rx: Receiver<Arc<[u8]>>) -> Result<Vec<u8>, Box<dyn Error>> {
     let (mut server, mut client) = tokio::io::duplex(65_536);
     timeout(WAIT, stream_events(&mut server, rx)).await??;
     drop(server);
@@ -396,8 +330,8 @@ mod tests {
   /// channel's sender and where its result will arrive.
   ///
   /// The sender must be kept alive, or the closed channel ends the loop.
-  fn start() -> (DuplexStream, Sender<Event>, Viewer) {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+  fn start() -> (DuplexStream, Sender<Arc<[u8]>>, Viewer) {
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     let (mut server, client) = tokio::io::duplex(65_536);
     let viewer = isolated(async move { stream_events(&mut server, rx).await });
     (client, tx, viewer)
@@ -455,12 +389,12 @@ mod tests {
     Ok(timeout(WAIT, viewer).await??)
   }
 
-  // ---- sending events ----
+  // ---- writing messages ----
 
   #[tokio::test]
-  async fn writes_nothing_when_the_channel_closes_without_events() -> TestResult
+  async fn writes_nothing_when_the_feed_closes_without_messages() -> TestResult
   {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     drop(tx);
 
     let written = run(rx).await?;
@@ -470,33 +404,26 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn writes_each_event_as_one_text_frame_of_json() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
-    let first = event(1);
-    let second = event(2);
-    let shown = |event: &Event| {
-      let mut event = event.clone();
-      event.peer_address = SocketAddr::from(([203, 0, 113, 0], 0));
-      serde_json::to_string(&event)
-    };
-    let expected = [shown(&first)?, shown(&second)?];
+  async fn writes_each_message_exactly_as_it_was_received() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
+    let first = message(1);
+    let second = message(2);
+    let expected = [first.as_ref(), second.as_ref()].concat();
     let _ = tx.send(first);
     let _ = tx.send(second);
     drop(tx);
 
     let written = run(rx).await?;
 
-    let payloads = payloads(&written).ok_or("not a run of text frames")?;
-    let expected: Vec<&[u8]> = expected.iter().map(String::as_bytes).collect();
-    assert_eq!(payloads, expected);
+    assert_eq!(written, expected);
     Ok(())
   }
 
   #[tokio::test]
-  async fn keeps_the_order_in_which_events_were_sent() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+  async fn keeps_the_order_in_which_messages_were_sent() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     for connection_id in 1..=5 {
-      let _ = tx.send(event(connection_id));
+      let _ = tx.send(message(connection_id));
     }
     drop(tx);
 
@@ -511,12 +438,12 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn skips_missed_events_and_carries_on_after_lagging() -> TestResult {
-    // The channel holds two events, so the first three of these five are
+  async fn skips_missed_messages_and_carries_on_after_lagging() -> TestResult {
+    // The channel holds two messages, so the first three of these five are
     // gone by the time the viewer starts reading.
-    let (tx, rx) = broadcast::channel::<Event>(2);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(2);
     for connection_id in 1..=5 {
-      let _ = tx.send(event(connection_id));
+      let _ = tx.send(message(connection_id));
     }
     drop(tx);
 
@@ -528,11 +455,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn only_sees_events_sent_after_it_subscribed() -> TestResult {
-    let (tx, _) = broadcast::channel::<Event>(16);
-    let _ = tx.send(event(1));
+  async fn only_sees_messages_sent_after_it_subscribed() -> TestResult {
+    let (tx, _) = broadcast::channel::<Arc<[u8]>>(16);
+    let _ = tx.send(message(1));
     let rx = tx.subscribe();
-    let _ = tx.send(event(2));
+    let _ = tx.send(message(2));
     drop(tx);
 
     let written = run(rx).await?;
@@ -543,9 +470,9 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn waits_for_more_events_while_the_channel_is_open() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
-    let _ = tx.send(event(1));
+  async fn waits_for_more_messages_while_the_feed_is_open() -> TestResult {
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
+    let _ = tx.send(message(1));
     let (mut server, mut client) = tokio::io::duplex(65_536);
 
     let outcome =
@@ -561,17 +488,17 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn keeps_streaming_events_after_answering_a_ping() -> TestResult {
+  async fn keeps_writing_messages_after_answering_a_ping() -> TestResult {
     let (mut client, tx, _viewer) = start();
 
-    let _ = tx.send(event(1));
+    let _ = tx.send(message(1));
     let (first, payload) = read_frame(&mut client).await?;
     assert_eq!((first, id(&payload)?), (0x81, Some(1)));
 
     client.write_all(&client_frame(0x89, b"hi")).await?;
     assert_eq!(read_frame(&mut client).await?, (0x8a, b"hi".to_vec()));
 
-    let _ = tx.send(event(2));
+    let _ = tx.send(message(2));
     let (first, payload) = read_frame(&mut client).await?;
     assert_eq!((first, id(&payload)?), (0x81, Some(2)));
     Ok(())
@@ -745,7 +672,7 @@ mod tests {
     // lets it run about once per frame; one that does not lets it run
     // once at most.
     let ticks = isolated(async {
-      let (_tx, rx) = broadcast::channel::<Event>(16);
+      let (_tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
       let (mut server, mut client) = tokio::io::duplex(65_536);
       let count = Arc::new(AtomicUsize::new(0));
       let counter = Arc::clone(&count);
@@ -788,171 +715,19 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn stops_when_the_client_has_gone_with_an_event_pending() -> TestResult
+  async fn stops_when_the_client_has_gone_with_a_message_pending() -> TestResult
   {
     // `tx` stays alive, so only the client going can end the loop. Whether
     // that shows up as a failed write or as end of file on the read side,
     // the loop must not hang.
-    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     let (mut server, client) = tokio::io::duplex(64);
     drop(client);
-    let _ = tx.send(event(1));
+    let _ = tx.send(message(1));
 
     let outcome = timeout(WAIT, stream_events(&mut server, rx)).await;
 
     assert!(outcome.is_ok());
-    Ok(())
-  }
-
-  #[tokio::test]
-  async fn never_broadcasts_the_full_peer_address() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
-    let _ = tx.send(event(1));
-    drop(tx);
-
-    let written = run(rx).await?;
-
-    let payloads = payloads(&written).ok_or("not a run of text frames")?;
-    let text = String::from_utf8_lossy(payloads.first().ok_or("no frame")?);
-    assert!(text.contains(r#""peer_address":"203.0.113.0:0""#));
-    assert!(!text.contains("203.0.113.9"));
-    assert!(!text.contains("51234"));
-    Ok(())
-  }
-
-  #[tokio::test]
-  async fn never_broadcasts_the_rejection_detail() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
-    let mut rejected = event(1);
-    rejected.kind = Kind::Rejected {
-      reason: RejectReason::Malformed,
-      detail: Some("bad target"),
-      status: Some(400),
-    };
-    let _ = tx.send(rejected);
-    drop(tx);
-
-    let written = run(rx).await?;
-
-    let payloads = payloads(&written).ok_or("not a run of text frames")?;
-    let text = String::from_utf8_lossy(payloads.first().ok_or("no frame")?);
-    assert!(text.contains(r#""reason":"malformed","detail":null"#));
-    assert!(!text.contains("bad target"));
-    Ok(())
-  }
-
-  fn address(text: &str) -> Result<SocketAddr, std::net::AddrParseError> {
-    text.parse()
-  }
-
-  #[test]
-  fn truncate_keeps_the_ipv4_slash_24_and_drops_the_port() -> TestResult {
-    let truncated = truncate_peer_address(address("203.0.113.9:51234")?);
-    assert_eq!(truncated, address("203.0.113.0:0")?);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_zeroes_the_whole_last_ipv4_octet() -> TestResult {
-    let truncated = truncate_peer_address(address("198.51.100.255:1")?);
-    assert_eq!(truncated, address("198.51.100.0:0")?);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_keeps_the_ipv6_slash_48_and_drops_the_port() -> TestResult {
-    let original = address("[2001:db8:abcd:12:34:56:78:9a]:443")?;
-    assert_eq!(
-      truncate_peer_address(original),
-      address("[2001:db8:abcd::]:0")?
-    );
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_cuts_ipv6_exactly_after_the_third_group() -> TestResult {
-    let original = address("[2001:db8:ffff:ffff::1]:1")?;
-    assert_eq!(
-      truncate_peer_address(original),
-      address("[2001:db8:ffff::]:0")?
-    );
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_treats_ipv4_mapped_ipv6_as_ipv4() -> TestResult {
-    let truncated =
-      truncate_peer_address(address("[::ffff:203.0.113.9]:51234")?);
-    assert_eq!(truncated, address("203.0.113.0:0")?);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_is_unchanged_on_an_already_truncated_address() -> TestResult {
-    let once = truncate_peer_address(address("203.0.113.9:51234")?);
-    assert_eq!(truncate_peer_address(once), once);
-    Ok(())
-  }
-
-  /// `kind` as JSON, for comparing kinds, which do not implement
-  /// `PartialEq`.
-  fn json(kind: &Kind) -> Result<String, serde_json::Error> {
-    serde_json::to_string(kind)
-  }
-
-  #[test]
-  fn truncate_kind_removes_the_rejection_detail() -> TestResult {
-    let kind = Kind::Rejected {
-      reason: RejectReason::Malformed,
-      detail: Some("bad target"),
-      status: Some(400),
-    };
-    let expected = Kind::Rejected {
-      reason: RejectReason::Malformed,
-      detail: None,
-      status: Some(400),
-    };
-    assert_eq!(json(&truncate_kind(kind))?, json(&expected)?);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_kind_leaves_a_rejection_without_detail_unchanged() -> TestResult {
-    let kind = Kind::Rejected {
-      reason: RejectReason::Timeout,
-      detail: None,
-      status: Some(408),
-    };
-    let before = json(&kind)?;
-    assert_eq!(json(&truncate_kind(kind))?, before);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_kind_leaves_a_request_unchanged() -> TestResult {
-    let kind = Kind::Request {
-      method: "GET".to_owned(),
-      target: "/?q=1".to_owned(),
-      target_length: 5,
-      version: "HTTP/1.1".to_owned(),
-      status: 200,
-      user_agent: Some("curl/8.0".to_owned()),
-      user_agent_length: 8,
-      host_class: HostClass::Own,
-      header_count: 3,
-    };
-    let before = json(&kind)?;
-    assert_eq!(json(&truncate_kind(kind))?, before);
-    Ok(())
-  }
-
-  #[test]
-  fn truncate_kind_leaves_a_shed_unchanged() -> TestResult {
-    let kind = Kind::Shed {
-      reason: ShedReason::IpLimit,
-    };
-    let before = json(&kind)?;
-    assert_eq!(json(&truncate_kind(kind))?, before);
     Ok(())
   }
 
@@ -989,7 +764,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn a_silent_viewer_is_closed_once_its_lifetime_passes() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     let (mut server, mut client) = tokio::io::duplex(65_536);
     let started = tokio::time::Instant::now();
     let viewer =
@@ -1010,18 +785,18 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn a_busy_viewer_is_still_closed_on_time() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     let (mut server, mut client) = tokio::io::duplex(65_536);
     let started = tokio::time::Instant::now();
     let viewer =
       tokio::spawn(async move { stream_events(&mut server, rx).await });
-    // An event every minute for twice the lifetime. If activity reset the
+    // A message every minute for twice the lifetime. If activity reset the
     // countdown, the viewer would outlive the sender, and the closed
     // channel would end it without the lifetime close.
     let minutes = MAX_VIEWER_LIFE.as_secs().div_ceil(60).saturating_mul(2);
     let sender = tokio::spawn(async move {
       for connection_id in 0..minutes {
-        let _ = tx.send(event(connection_id));
+        let _ = tx.send(message(connection_id));
         tokio::time::sleep(Duration::from_secs(60)).await;
       }
     });
@@ -1033,8 +808,8 @@ mod tests {
     assert!(elapsed >= MAX_VIEWER_LIFE);
     assert!(elapsed < MAX_VIEWER_LIFE + Duration::from_secs(60));
     let frames = frames(&written).ok_or("not a run of server frames")?;
-    let events = frames.iter().filter(|(first, _)| *first == 0x81).count();
-    assert!(events > 1, "only {events} events reached the viewer");
+    let messages = frames.iter().filter(|(first, _)| *first == 0x81).count();
+    assert!(messages > 1, "only {messages} messages reached the viewer");
     assert!(ends_with_lifetime_close(&frames));
     assert!(viewer.await?.is_ok());
     sender.abort();
@@ -1045,13 +820,13 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn gives_up_on_a_viewer_that_stops_reading() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
-    // One event is bigger than the pipe, so the first write blocks. The
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
+    // One message is bigger than the pipe, so the first write blocks. The
     // client end must stay alive (not `_`), or the write fails at once
     // instead of blocking.
     let (mut server, _client) = tokio::io::duplex(64);
     for connection_id in 1..=3 {
-      let _ = tx.send(event(connection_id));
+      let _ = tx.send(message(connection_id));
     }
 
     let started = tokio::time::Instant::now();
@@ -1067,12 +842,12 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn does_not_give_up_on_a_slow_reader_that_keeps_up() -> TestResult {
-    let (tx, rx) = broadcast::channel::<Event>(16);
+    let (tx, rx) = broadcast::channel::<Arc<[u8]>>(16);
     let (mut server, mut client) = tokio::io::duplex(64);
     for connection_id in 1..=6 {
-      let _ = tx.send(event(connection_id));
+      let _ = tx.send(message(connection_id));
     }
-    // The six events are still delivered, then the closed channel ends
+    // The six messages are still delivered, then the closed channel ends
     // the loop with Ok.
     drop(tx);
 

@@ -78,11 +78,12 @@ const LINGER_CAP: usize = 64 * 1024;
 /// [`RequestError::status`] and an error page is sent. Errors with no status,
 /// where the client has gone or the socket is broken, send nothing.
 ///
-/// One [`Event`] describing the connection is sent on `tx` after the write,
-/// whatever the outcome. `connection_id` is the number given to this
-/// connection when it was accepted. `viewer_pool` holds the slots for
-/// WebSocket viewers, and `viewer_ip_limit` limits how many of them one
-/// client address may hold.
+/// One [`Event`] describing the connection is sent on `tx_event` after the
+/// write, whatever the outcome. `tx_viewer_feed` is the viewer feed,
+/// which a connection that becomes a viewer subscribes to. `connection_id`
+/// is the number given to this connection when it was accepted.
+/// `viewer_pool` holds the slots for WebSocket viewers, and
+/// `viewer_ip_limit` limits how many of them one client address may hold.
 ///
 /// If the response is 101 Switching Protocols, a permit is taken from
 /// `viewer_ip_limit` for the client's address and then a slot from
@@ -90,12 +91,13 @@ const LINGER_CAP: usize = 64 * 1024;
 /// address was under its limit. If either refuses, the response is replaced
 /// with 503 Service Unavailable and the connection is closed like any other.
 /// Otherwise, once the 101 is written successfully, the connection becomes a
-/// viewer and keeps both until this function returns. It subscribes to `tx`
-/// before its own event is sent, so that event is the first one it receives.
-/// Then [`viewer::stream_events`] keeps the connection open and streams
-/// every event to the client until the client goes away. Any other
-/// connection is closed with [`lingering_close`] before this function
-/// returns, so the client can read the whole response.
+/// viewer and keeps both until this function returns. It subscribes to the
+/// viewer feed before its own event is sent, so that event reaches it through
+/// the feed like any other, unless the feed's budget for the window is already
+/// used up. Then [`viewer::stream_events`] keeps the connection open and writes
+/// the feed to the client until the client goes away. Any other connection is
+/// closed with [`lingering_close`] before this function returns, so the client
+/// can read the whole response.
 ///
 /// # Errors
 ///
@@ -106,7 +108,8 @@ const LINGER_CAP: usize = 64 * 1024;
 pub async fn handle(
   mut stream: TcpStream,
   addr: SocketAddr,
-  tx: Sender<Event>,
+  tx_event: Sender<Event>,
+  tx_viewer_feed: Sender<Arc<[u8]>>,
   connection_id: u64,
   viewer_pool: Arc<Semaphore>,
   viewer_ip_limit: Arc<IpLimit>,
@@ -157,12 +160,12 @@ pub async fn handle(
       Ok((_, response))
         if matches!(response.status, Status::SwitchingProtocols)
     );
-  let viewer = upgraded.then(|| tx.subscribe());
+  let viewer = upgraded.then(|| tx_viewer_feed.subscribe());
 
   publish_event(
     connection_id,
     addr,
-    &tx,
+    &tx_event,
     result.as_ref(),
     buffer.len(),
     &start_time,
@@ -442,6 +445,8 @@ mod tests {
   use tokio::net::TcpListener;
   use tokio::sync::broadcast;
 
+  use crate::websocket::Frame;
+
   type TestResult = Result<(), Box<dyn Error>>;
 
   const UPGRADE: &[u8] = b"GET /ws HTTP/1.1\r\n\
@@ -453,18 +458,34 @@ mod tests {
     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     \r\n";
 
+  /// A viewer feed for tests: a sender with no subscribers yet. No feed task
+  /// runs in these tests, so nothing is sent on it unless a test sends it.
+  fn feed() -> Sender<Arc<[u8]>> {
+    Sender::new(16)
+  }
+
   /// Starts `handle` on one loopback connection, as connection 1, with one
   /// free viewer slot and a limit of two viewers per address, and returns
-  /// the client's end of it.
-  async fn connect(tx: Sender<Event>) -> io::Result<TcpStream> {
-    connect_with(tx, Arc::new(Semaphore::new(1)), Arc::new(IpLimit::new(2)))
-      .await
+  /// the client's end of it. Events go to `tx`, and a connection that
+  /// becomes a viewer subscribes to `feed`.
+  async fn connect(
+    tx: Sender<Event>,
+    feed: Sender<Arc<[u8]>>,
+  ) -> io::Result<TcpStream> {
+    connect_with(
+      tx,
+      feed,
+      Arc::new(Semaphore::new(1)),
+      Arc::new(IpLimit::new(2)),
+    )
+    .await
   }
 
   /// Like [`connect`], but with the viewer slots given by `viewers` and the
   /// per-address viewer limit given by `viewer_ip_limit`.
   async fn connect_with(
     tx: Sender<Event>,
+    feed: Sender<Arc<[u8]>>,
     viewers: Arc<Semaphore>,
     viewer_ip_limit: Arc<IpLimit>,
   ) -> io::Result<TcpStream> {
@@ -472,7 +493,8 @@ mod tests {
     let address = listener.local_addr()?;
     tokio::spawn(async move {
       if let Ok((stream, peer)) = listener.accept().await {
-        let _ = handle(stream, peer, tx, 1, viewers, viewer_ip_limit).await;
+        let _ =
+          handle(stream, peer, tx, feed, 1, viewers, viewer_ip_limit).await;
       }
     });
     TcpStream::connect(address).await
@@ -504,7 +526,7 @@ mod tests {
   }
 
   /// Waits until `handle` has subscribed to the channel.
-  async fn subscribed(tx: &Sender<Event>) -> Result<(), Box<dyn Error>> {
+  async fn subscribed<T>(tx: &Sender<T>) -> Result<(), Box<dyn Error>> {
     for _ in 0..500 {
       if tx.receiver_count() > 0 {
         return Ok(());
@@ -528,6 +550,13 @@ mod tests {
         status: None,
       },
     }
+  }
+
+  /// The finished frame the viewer feed would send for [`event`] with
+  /// `connection_id`: a text frame of its JSON.
+  fn message(connection_id: u64) -> Arc<[u8]> {
+    let json = serde_json::to_string(&event(connection_id)).unwrap_or_default();
+    Arc::from(Frame::text(json.as_bytes()).to_bytes())
   }
 
   fn id(event: &Value) -> Option<u64> {
@@ -559,7 +588,7 @@ mod tests {
   async fn a_client_that_sends_nothing_gets_408_after_the_head_timeout()
   -> TestResult {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx).await?;
+    let mut client = connect(tx, feed()).await?;
     // The clock is paused and jumps ahead whenever every task is waiting, so
     // this runs at once. Twice the deadline leaves room for the server's own.
     let mut response = Vec::new();
@@ -692,7 +721,7 @@ mod tests {
   async fn a_plain_request_is_answered_and_the_connection_closed() -> TestResult
   {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx).await?;
+    let mut client = connect(tx, feed()).await?;
     client
       .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
       .await?;
@@ -710,7 +739,7 @@ mod tests {
   async fn a_refused_handshake_is_answered_and_the_connection_closed()
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx).await?;
+    let mut client = connect(tx, feed()).await?;
     client
       .write_all(
         b"GET /ws HTTP/1.1\r\nHost: wire.stampatron.com\r\n\
@@ -727,31 +756,47 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn an_upgraded_connection_is_sent_later_events_as_frames() -> TestResult
-  {
+  async fn an_upgraded_connection_is_sent_the_viewer_feed() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx.clone()).await?;
+    let feed = feed();
+    let mut client = connect(tx, feed.clone()).await?;
     client.write_all(UPGRADE).await?;
 
     let head = timeout(Duration::from_secs(5), read_response_head(&mut client))
       .await??;
     assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
-    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
-    let _ = tx.send(event(41));
-    let _ = tx.send(event(42));
+    timeout(Duration::from_secs(10), subscribed(&feed)).await??;
+    let _ = feed.send(message(41));
+    let _ = feed.send(message(42));
 
-    // The connection's own handshake event (id 1) may or may not come
-    // first, depending on when `handle` subscribes. Skip it if it does.
-    let mut seen = Vec::new();
-    while seen.len() < 2 {
-      let event =
-        timeout(Duration::from_secs(5), read_event(&mut client)).await??;
-      if id(&event) != Some(1) {
-        seen.push(id(&event));
-      }
-    }
-    assert_eq!(seen, [Some(41), Some(42)]);
+    let first =
+      timeout(Duration::from_secs(5), read_event(&mut client)).await??;
+    let second =
+      timeout(Duration::from_secs(5), read_event(&mut client)).await??;
+    assert_eq!([id(&first), id(&second)], [Some(41), Some(42)]);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn an_upgraded_connection_is_never_sent_the_event_channel() -> TestResult
+  {
+    // Events on the event channel are untrimmed: full peer addresses and
+    // rejection details. A viewer must only ever be written what comes
+    // through the feed.
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let feed = feed();
+    let mut client = connect(tx.clone(), feed.clone()).await?;
+    client.write_all(UPGRADE).await?;
+    timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
+    timeout(Duration::from_secs(10), subscribed(&feed)).await??;
+
+    let _ = tx.send(event(41));
+    let _ = feed.send(message(42));
+
+    let first =
+      timeout(Duration::from_secs(5), read_event(&mut client)).await??;
+    assert_eq!(id(&first), Some(42));
     Ok(())
   }
 
@@ -759,7 +804,7 @@ mod tests {
   async fn an_upgraded_connection_publishes_its_handshake_as_a_request()
   -> TestResult {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx).await?;
+    let mut client = connect(tx, feed()).await?;
     client.write_all(UPGRADE).await?;
 
     let event = timeout(Duration::from_secs(5), rx.recv()).await??;
@@ -773,20 +818,21 @@ mod tests {
   async fn an_upgraded_connection_stops_when_the_client_has_gone() -> TestResult
   {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client = connect(tx.clone()).await?;
+    let feed = feed();
+    let mut client = connect(tx, feed.clone()).await?;
     client.write_all(UPGRADE).await?;
     timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
-    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+    timeout(Duration::from_secs(10), subscribed(&feed)).await??;
 
     drop(client);
 
     // The server only notices on a write, and the first write after the
     // client closes can still succeed, so keep sending until it lets go.
     for connection_id in 100..600 {
-      if tx.receiver_count() == 0 {
+      if feed.receiver_count() == 0 {
         return Ok(());
       }
-      let _ = tx.send(event(connection_id));
+      let _ = feed.send(message(connection_id));
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err("the connection was still subscribed after the client left".into())
@@ -796,9 +842,13 @@ mod tests {
   async fn an_upgrade_is_refused_with_503_when_no_viewer_slot_is_free()
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client =
-      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
-        .await?;
+    let mut client = connect_with(
+      tx,
+      feed(),
+      Arc::new(Semaphore::new(0)),
+      Arc::new(IpLimit::new(1)),
+    )
+    .await?;
     client.write_all(UPGRADE).await?;
 
     // Reading to the end only returns once the server has closed.
@@ -813,9 +863,13 @@ mod tests {
   #[tokio::test]
   async fn a_refused_upgrade_publishes_a_503() -> TestResult {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
-    let mut client =
-      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
-        .await?;
+    let mut client = connect_with(
+      tx,
+      feed(),
+      Arc::new(Semaphore::new(0)),
+      Arc::new(IpLimit::new(1)),
+    )
+    .await?;
     client.write_all(UPGRADE).await?;
 
     let event = timeout(Duration::from_secs(5), rx.recv()).await??;
@@ -827,9 +881,13 @@ mod tests {
   #[tokio::test]
   async fn a_plain_request_does_not_need_a_viewer_slot() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
-    let mut client =
-      connect_with(tx, Arc::new(Semaphore::new(0)), Arc::new(IpLimit::new(1)))
-        .await?;
+    let mut client = connect_with(
+      tx,
+      feed(),
+      Arc::new(Semaphore::new(0)),
+      Arc::new(IpLimit::new(1)),
+    )
+    .await?;
     client
       .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
       .await?;
@@ -846,17 +904,24 @@ mod tests {
   async fn a_second_viewer_is_refused_while_the_first_holds_the_slot()
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
+    let feed = feed();
     let viewers = Arc::new(Semaphore::new(1));
     let viewers_ip = Arc::new(IpLimit::new(2));
 
-    let mut first =
-      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+    let mut first = connect_with(
+      tx.clone(),
+      feed.clone(),
+      viewers.clone(),
+      viewers_ip.clone(),
+    )
+    .await?;
     first.write_all(UPGRADE).await?;
     let head =
       timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
     assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
-    let mut second = connect_with(tx, viewers, viewers_ip.clone()).await?;
+    let mut second =
+      connect_with(tx, feed, viewers, viewers_ip.clone()).await?;
     second.write_all(UPGRADE).await?;
     let mut response = Vec::new();
     timeout(Duration::from_secs(5), second.read_to_end(&mut response))
@@ -870,18 +935,25 @@ mod tests {
   async fn a_second_viewer_from_one_address_is_refused_by_its_limit()
   -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
+    let feed = feed();
     // Plenty of slots, so only the address limit can refuse.
     let viewers = Arc::new(Semaphore::new(2));
     let viewers_ip = Arc::new(IpLimit::new(1));
 
-    let mut first =
-      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+    let mut first = connect_with(
+      tx.clone(),
+      feed.clone(),
+      viewers.clone(),
+      viewers_ip.clone(),
+    )
+    .await?;
     first.write_all(UPGRADE).await?;
     let head =
       timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
     assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
 
-    let mut second = connect_with(tx, viewers.clone(), viewers_ip).await?;
+    let mut second =
+      connect_with(tx, feed, viewers.clone(), viewers_ip).await?;
     second.write_all(UPGRADE).await?;
     let mut response = Vec::new();
     timeout(Duration::from_secs(5), second.read_to_end(&mut response))
@@ -893,22 +965,33 @@ mod tests {
   #[tokio::test]
   async fn an_address_can_view_again_after_its_viewer_leaves() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
+    let feed = feed();
     let viewers = Arc::new(Semaphore::new(2));
     let viewers_ip = Arc::new(IpLimit::new(1));
 
-    let mut first =
-      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+    let mut first = connect_with(
+      tx.clone(),
+      feed.clone(),
+      viewers.clone(),
+      viewers_ip.clone(),
+    )
+    .await?;
     first.write_all(UPGRADE).await?;
     timeout(Duration::from_secs(5), read_response_head(&mut first)).await??;
-    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+    timeout(Duration::from_secs(10), subscribed(&feed)).await??;
     drop(first);
 
     // The server only notices the client has gone on a write, so keep
-    // sending events and trying again until the address's permit is freed.
+    // sending messages and trying again until the address's permit is freed.
     for connection_id in 100..600 {
-      let _ = tx.send(event(connection_id));
-      let mut next =
-        connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+      let _ = feed.send(message(connection_id));
+      let mut next = connect_with(
+        tx.clone(),
+        feed.clone(),
+        viewers.clone(),
+        viewers_ip.clone(),
+      )
+      .await?;
       next.write_all(UPGRADE).await?;
       let head = timeout(Duration::from_secs(5), read_response_head(&mut next))
         .await??;
@@ -923,13 +1006,15 @@ mod tests {
   #[tokio::test]
   async fn a_viewer_holds_its_slot_until_the_client_has_gone() -> TestResult {
     let (tx, _) = broadcast::channel::<Event>(16);
+    let feed = feed();
     let viewers = Arc::new(Semaphore::new(1));
     let viewers_ip = Arc::new(IpLimit::new(1));
     let mut client =
-      connect_with(tx.clone(), viewers.clone(), viewers_ip.clone()).await?;
+      connect_with(tx, feed.clone(), viewers.clone(), viewers_ip.clone())
+        .await?;
     client.write_all(UPGRADE).await?;
     timeout(Duration::from_secs(5), read_response_head(&mut client)).await??;
-    timeout(Duration::from_secs(10), subscribed(&tx)).await??;
+    timeout(Duration::from_secs(10), subscribed(&feed)).await??;
 
     assert_eq!(viewers.available_permits(), 0);
 
@@ -941,7 +1026,7 @@ mod tests {
       if viewers.available_permits() == 1 {
         return Ok(());
       }
-      let _ = tx.send(event(connection_id));
+      let _ = feed.send(message(connection_id));
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err("the viewer slot was not released after the client left".into())

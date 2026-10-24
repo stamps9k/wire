@@ -13,6 +13,7 @@ use tokio::time::Duration;
 use crate::event::Event;
 use crate::event::ShedReason;
 use crate::server::IpLimit;
+use crate::server::run_viewer_feed;
 use crate::site::validate_templates;
 
 mod event;
@@ -76,9 +77,12 @@ const MAX_IP_COUNT: u32 = 16;
 /// like any other, then closed at once and published as a shed event; the
 /// loop goes straight on to the next `accept`.
 ///
-/// Each connection is given a number, counting from 1, and a sender for the
-/// event channel. A separate task subscribes to that channel and prints
-/// every event to standard output as one line of JSON.
+/// Each connection is given a number, counting from 1, a sender for the
+/// event channel and a sender for the viewer feed. A separate task
+/// subscribes to the event channel and prints every event to standard
+/// output as one line of JSON. Another runs the viewer feed (see
+/// [`server::run_viewer_feed`]), which forwards events to WebSocket viewers
+/// within a budget per window and summarises the rest.
 ///
 /// A failed `accept` is logged and retried after 100 ms, so running out of
 /// file descriptors does not spin the loop. Errors from a connection are
@@ -105,13 +109,15 @@ async fn main() -> io::Result<()> {
   let connection_ip_limit = Arc::new(IpLimit::new(MAX_IP_COUNT));
   let viewer_ip_limit = Arc::new(IpLimit::new(MAX_VIEWERS_PER_IP));
   let listener = TcpListener::bind("0.0.0.0:8080").await?;
-  let (tx, mut rx) = broadcast::channel::<Event>(256);
+  let (tx_events, mut rx_events) = broadcast::channel::<Event>(256);
+  let rx_viewer_feed = tx_events.subscribe();
+  let tx_viewer_feed = broadcast::Sender::<Arc<[u8]>>::new(64);
   let mut connection_count: u64 = 0;
 
   // Task explicitly for logging only
   tokio::spawn(async move {
     loop {
-      let event = match rx.recv().await {
+      let event = match rx_events.recv().await {
         Ok(v) => v,
         Err(RecvError::Lagged(skipped)) => {
           eprintln!("subscriber lagged, skipped {skipped} events");
@@ -131,6 +137,9 @@ async fn main() -> io::Result<()> {
     }
   });
 
+  // Task that limits and frames the events sent to viewers
+  tokio::spawn(run_viewer_feed(rx_viewer_feed, tx_viewer_feed.clone()));
+
   loop {
     let (stream, peer) = match listener.accept().await {
       Ok(c) => c,
@@ -144,16 +153,17 @@ async fn main() -> io::Result<()> {
     connection_count = connection_count.wrapping_add(1);
 
     let Some(ip_permit) = connection_ip_limit.try_acquire(peer.ip()) else {
-      server::shed(connection_count, peer, ShedReason::IpLimit, &tx);
+      server::shed(connection_count, peer, ShedReason::IpLimit, &tx_events);
       continue;
     };
 
     let Ok(permit) = connection_pool.clone().try_acquire_owned() else {
-      server::shed(connection_count, peer, ShedReason::Capacity, &tx);
+      server::shed(connection_count, peer, ShedReason::Capacity, &tx_events);
       continue;
     };
 
-    let tx = tx.clone();
+    let tx = tx_events.clone();
+    let tx_viewer_feed = tx_viewer_feed.clone();
     let viewer_pool = viewer_pool.clone();
     let viewer_ip_limit = viewer_ip_limit.clone();
     tokio::spawn(async move {
@@ -163,6 +173,7 @@ async fn main() -> io::Result<()> {
         stream,
         peer,
         tx,
+        tx_viewer_feed,
         connection_count,
         viewer_pool,
         viewer_ip_limit,
