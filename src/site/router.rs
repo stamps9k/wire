@@ -21,12 +21,15 @@ use crate::websocket;
 ///
 /// Each entry must match the header exactly, as scheme, host and any
 /// non-default port, with no trailing slash. The entries are the debug page
-/// on wire over HTTP and, once wire supports TLS, over HTTPS; the particle
-/// page; and the debug page served by a local development container.
+/// on wire over HTTP and, once wire supports TLS, over HTTPS, and the
+/// particle page. Debug builds also allow the debug page served by a local
+/// development container; that entry is left out of release builds, so the
+/// production binary never accepts it.
 const ALLOWED_ORIGINS: &[&str] = &[
   "http://wire.stampatron.com",
   "https://wire.stampatron.com",
   "https://webgpu-particles.stampatron.com",
+  #[cfg(debug_assertions)]
   "http://localhost:8080",
 ];
 
@@ -337,6 +340,12 @@ mod tests {
   #[test]
   fn an_upgrade_without_an_origin_is_forbidden() {
     assert_eq!(upgrade_code(None), 403);
+  }
+
+  #[test]
+  fn the_local_development_origin_is_only_allowed_in_debug_builds() {
+    let expected = if cfg!(debug_assertions) { 101 } else { 403 };
+    assert_eq!(upgrade_code(Some(b"http://localhost:8080")), expected);
   }
 
   #[test]
