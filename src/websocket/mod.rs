@@ -4,5 +4,5 @@
 mod frame;
 mod handshake;
 
-pub use frame::{Frame, FrameBuffer, FrameError, OpCode};
+pub use frame::{Frame, FrameBuffer, OpCode};
 pub use handshake::upgrade;

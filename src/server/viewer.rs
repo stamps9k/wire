@@ -17,7 +17,6 @@ use tokio::time::timeout;
 
 use crate::websocket::Frame;
 use crate::websocket::FrameBuffer;
-use crate::websocket::FrameError;
 use crate::websocket::OpCode;
 
 /// The largest payload accepted from a viewer: enough for any control frame,
@@ -68,11 +67,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// of [`MAX_FRAME_PAYLOAD`]. Between frames the loop yields, so a client
 /// sending many frames at once cannot keep other tasks off the thread. A
 /// ping is answered with a pong carrying the same payload, and a pong is
-/// ignored. A close is answered with a close echoing its status code, which
-/// ends the loop. Text and binary frames have no meaning for a viewer and
-/// are ignored. A frame that breaks the protocol or exceeds the cap is
-/// answered with a close carrying the code from [`FrameError::close_code`],
-/// which also ends the loop.
+/// ignored. A close is checked with [`Frame::close_code`]: a valid code is
+/// echoed back, a close with no code is answered with 1000, and either way
+/// the reply carries no reason and ends the loop. Text and binary frames
+/// have no meaning for a viewer and are ignored. A close that fails the
+/// check, or a frame that breaks the protocol or exceeds the cap, is
+/// answered with a close carrying the error's code and reason, which also
+/// ends the loop.
 ///
 /// Once the viewer has been connected for [`MAX_VIEWER_LIFE`], it is sent a
 /// close with [`LIFETIME_CLOSE_CODE`] and the loop ends, whatever else is
@@ -130,11 +131,12 @@ where
             Ok(Some(frame)) => {
               match frame.opcode {
                 OpCode::Close => {
-                  let code = frame
-                    .payload
-                    .first_chunk::<2>()
-                    .map_or(1000, |bytes| u16::from_be_bytes(*bytes));
-                  let bytes = Frame::close(code, "").to_bytes();
+                  let (code, reason) = match Frame::close_code(&frame.payload) {
+                    Ok(Some(code)) => (code, ""),
+                    Ok(None) => (1000, ""),
+                    Err(e) => (e.close_code(), e.reason()),
+                  };
+                  let bytes = Frame::close(code, reason).to_bytes();
                   write_frame(stream, &bytes).await?;
                   return Ok(());
                 },
@@ -152,11 +154,7 @@ where
               }
             },
             Err(e) => {
-              let reason = match e {
-                FrameError::Protocol(reason) => reason,
-                FrameError::TooLarge => "",
-              };
-              let bytes = Frame::close(e.close_code(), reason).to_bytes();
+              let bytes = Frame::close(e.close_code(), e.reason()).to_bytes();
               write_frame(stream, &bytes).await?;
               return Ok(());
             }
@@ -600,6 +598,64 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn echoes_an_application_close_code() -> TestResult {
+    let (mut client, _tx, viewer) = start();
+
+    // 4000, the code the server itself uses for the lifetime close.
+    client.write_all(&client_frame(0x88, b"\x0f\xa0")).await?;
+
+    assert_eq!(read_frame(&mut client).await?, (0x88, vec![0x0f, 0xa0]));
+    assert!(finished(viewer).await?.is_ok());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn closes_with_1002_instead_of_echoing_a_forbidden_code() -> TestResult
+  {
+    let (mut client, _tx, viewer) = start();
+
+    // 1005 must never be sent, so it is not echoed back.
+    client.write_all(&client_frame(0x88, b"\x03\xed")).await?;
+
+    assert_eq!(
+      read_frame(&mut client).await?,
+      (0x88, b"\x03\xeainvalid close code".to_vec())
+    );
+    assert!(finished(viewer).await?.is_ok());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn closes_with_1002_on_a_one_byte_close() -> TestResult {
+    let (mut client, _tx, viewer) = start();
+
+    client.write_all(&client_frame(0x88, b"\x03")).await?;
+
+    assert_eq!(
+      read_frame(&mut client).await?,
+      (0x88, b"\x03\xeaclose payload has one byte".to_vec())
+    );
+    assert!(finished(viewer).await?.is_ok());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn closes_with_1007_when_a_close_reason_is_not_utf8() -> TestResult {
+    let (mut client, _tx, viewer) = start();
+
+    client
+      .write_all(&client_frame(0x88, b"\x03\xe8bad \xff"))
+      .await?;
+
+    assert_eq!(
+      read_frame(&mut client).await?,
+      (0x88, b"\x03\xefinvalid utf-8".to_vec())
+    );
+    assert!(finished(viewer).await?.is_ok());
+    Ok(())
+  }
+
+  #[tokio::test]
   async fn closes_with_1002_on_a_protocol_error() -> TestResult {
     let (mut client, _tx, viewer) = start();
 
@@ -620,7 +676,10 @@ mod tests {
     // A binary frame announcing 126 bytes, one more than a viewer accepts.
     client.write_all(&[0x82, 0xfe, 0x00, 0x7e]).await?;
 
-    assert_eq!(read_frame(&mut client).await?, (0x88, vec![0x03, 0xf1]));
+    assert_eq!(
+      read_frame(&mut client).await?,
+      (0x88, b"\x03\xf1frame too large".to_vec())
+    );
     assert!(finished(viewer).await?.is_ok());
     Ok(())
   }

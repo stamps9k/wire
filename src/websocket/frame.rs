@@ -46,8 +46,10 @@ pub struct Frame {
   pub payload: Vec<u8>,
 }
 
-/// Why a frame from a client was refused. Either way the connection is
-/// closed, with the status code the variant names.
+/// Why a frame from a client was refused. Whatever the reason, the
+/// connection is closed, with the status code from
+/// [`close_code`](Self::close_code) and the text from
+/// [`reason`](Self::reason).
 pub enum FrameError {
   /// The frame breaks a rule of RFC 6455; close with 1002 (protocol error).
   /// The reason names the rule.
@@ -55,6 +57,9 @@ pub enum FrameError {
   /// The payload is over the size the caller accepts; close with 1009
   /// (message too big).
   TooLarge,
+  /// Text that must be UTF-8 is not; close with 1007 (invalid frame
+  /// payload data).
+  InvalidUtf8,
 }
 
 /// Bytes received from a client, from which whole frames are taken.
@@ -108,6 +113,20 @@ impl FrameError {
     match self {
       Self::Protocol(_) => 1002,
       Self::TooLarge => 1009,
+      Self::InvalidUtf8 => 1007,
+    }
+  }
+
+  /// The reason to send with the close, naming what was wrong.
+  ///
+  /// A protocol error gives the rule it broke; the other variants have a
+  /// fixed text. Every reason is well under the 123 bytes a close frame
+  /// leaves for it.
+  pub fn reason(&self) -> &'static str {
+    match self {
+      Self::Protocol(reason) => reason,
+      Self::TooLarge => "frame too large",
+      Self::InvalidUtf8 => "invalid utf-8",
     }
   }
 }
@@ -158,6 +177,45 @@ impl Frame {
       fin: true,
       opcode: OpCode::Close,
       payload,
+    }
+  }
+
+  /// Reads and checks the status code of a close frame sent by a client,
+  /// from its `payload`.
+  ///
+  /// An empty payload carries no code and gives `Ok(None)`. Otherwise the
+  /// first two bytes are the code, as a big-endian `u16`, and the rest is a
+  /// reason, which must be UTF-8 but is otherwise ignored. The code must be
+  /// one RFC 6455 allows on the wire: 1000 to 1003, 1007 to 1014, or 3000 to
+  /// 4999 for registered and application codes. The others are either
+  /// reserved (below 1000, 1004, and 1016 to 2999), only for reporting
+  /// locally (1005, 1006 and 1015), or outside the range (5000 and above).
+  ///
+  /// # Errors
+  ///
+  /// Returns [`FrameError::Protocol`] if the payload is a single byte or the
+  /// code is not allowed, and [`FrameError::InvalidUtf8`] if the reason is
+  /// not UTF-8. The reason is checked first, so a payload with both problems
+  /// gives [`FrameError::InvalidUtf8`].
+  pub fn close_code(payload: &[u8]) -> Result<Option<u16>, FrameError> {
+    if payload.is_empty() {
+      return Ok(None);
+    }
+
+    let Some(code_bytes) = payload.first_chunk::<2>() else {
+      return Err(FrameError::Protocol("close payload has one byte"));
+    };
+    let code = u16::from_be_bytes(*code_bytes);
+
+    if std::str::from_utf8(payload.get(2..).unwrap_or_default()).is_err() {
+      return Err(FrameError::InvalidUtf8);
+    }
+
+    match code {
+      0..=999 | 1004..=1006 | 1015..=2999 | 5000..=u16::MAX => {
+        Err(FrameError::Protocol("invalid close code"))
+      }
+      1000..=1003 | 1007..=1014 | 3000..=4999 => Ok(Some(code)),
     }
   }
 
@@ -782,6 +840,99 @@ mod tests {
   #[test]
   fn oversized_payloads_close_with_1009() {
     assert_eq!(FrameError::TooLarge.close_code(), 1009);
+  }
+
+  #[test]
+  fn invalid_utf8_closes_with_1007() {
+    assert_eq!(FrameError::InvalidUtf8.close_code(), 1007);
+  }
+
+  // ---- reason ----
+
+  #[test]
+  fn a_protocol_error_gives_the_rule_it_broke() {
+    assert_eq!(FrameError::Protocol("any rule").reason(), "any rule");
+  }
+
+  #[test]
+  fn the_other_errors_give_a_fixed_reason() {
+    assert_eq!(FrameError::TooLarge.reason(), "frame too large");
+    assert_eq!(FrameError::InvalidUtf8.reason(), "invalid utf-8");
+  }
+
+  // ---- Frame::close_code ----
+
+  /// A close payload: `code` as a big-endian `u16`, then `reason`.
+  fn close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
+    let mut payload = code.to_be_bytes().to_vec();
+    payload.extend_from_slice(reason);
+    payload
+  }
+
+  /// Whether `payload` is refused as a protocol error.
+  fn bad_close(payload: &[u8]) -> bool {
+    matches!(Frame::close_code(payload), Err(FrameError::Protocol(_)))
+  }
+
+  #[test]
+  fn a_close_with_no_payload_has_no_code() {
+    assert!(matches!(Frame::close_code(&[]), Ok(None)));
+  }
+
+  #[test]
+  fn a_close_with_one_byte_is_a_protocol_error() {
+    assert!(bad_close(&[0x03]));
+  }
+
+  #[test]
+  fn reads_the_code_as_big_endian() {
+    assert!(matches!(Frame::close_code(&[0x03, 0xe8]), Ok(Some(1000))));
+    // The same bytes the other way round are 59395, which is not allowed.
+    assert!(bad_close(&[0xe8, 0x03]));
+  }
+
+  #[test]
+  fn accepts_every_edge_of_the_allowed_ranges() {
+    for code in [1000, 1003, 1007, 1014, 3000, 4000, 4999] {
+      assert!(
+        matches!(
+          Frame::close_code(&close_payload(code, b"")),
+          Ok(Some(c)) if c == code
+        ),
+        "{code} was refused"
+      );
+    }
+  }
+
+  #[test]
+  fn refuses_every_edge_of_the_forbidden_ranges() {
+    for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, u16::MAX] {
+      assert!(bad_close(&close_payload(code, b"")), "{code} was accepted");
+    }
+  }
+
+  #[test]
+  fn accepts_a_utf8_reason_and_ignores_it() {
+    let payload = close_payload(1001, "タブを閉じた".as_bytes());
+    assert!(matches!(Frame::close_code(&payload), Ok(Some(1001))));
+  }
+
+  #[test]
+  fn refuses_a_reason_that_is_not_utf8() {
+    let payload = close_payload(1000, b"bad \xff byte");
+    assert!(matches!(
+      Frame::close_code(&payload),
+      Err(FrameError::InvalidUtf8)
+    ));
+  }
+
+  #[test]
+  fn a_bad_reason_wins_over_a_bad_code() {
+    let payload = close_payload(1005, b"\xff");
+    assert!(matches!(
+      Frame::close_code(&payload),
+      Err(FrameError::InvalidUtf8)
+    ));
   }
 
   // ---- FrameBuffer ----
