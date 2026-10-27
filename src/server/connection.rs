@@ -13,7 +13,6 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Duration;
@@ -70,6 +69,11 @@ const LINGER_CAP: usize = 64 * 1024;
 
 /// Serves one client connection from start to finish.
 ///
+/// `stream` is the connection itself: any stream that can be read and
+/// written, such as a plain TCP stream or a TLS stream wrapped around one.
+/// `addr` is the client's address, given separately because the stream
+/// does not have to know it.
+///
 /// Calls `serve` to read the request and decide the response, then writes
 /// that response with [`write_response`], which gives up after
 /// [`RESPONSE_TIMEOUT`].
@@ -105,15 +109,18 @@ const LINGER_CAP: usize = 64 * 1024;
 /// request, after any error response has been written. Returns
 /// [`RequestError::Io`] if writing the response fails or takes longer than
 /// [`RESPONSE_TIMEOUT`], or if reading from or writing to a viewer fails.
-pub async fn handle(
-  mut stream: TcpStream,
+pub async fn handle<S>(
+  mut stream: S,
   addr: SocketAddr,
   tx_event: Sender<Event>,
   tx_viewer_feed: Sender<Arc<[u8]>>,
   connection_id: u64,
   viewer_pool: Arc<Semaphore>,
   viewer_ip_limit: Arc<IpLimit>,
-) -> Result<(), RequestError> {
+) -> Result<(), RequestError>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   let start_time = SystemTime::now();
   let started = Instant::now();
   let mut buffer: Vec<u8> = Vec::new();
@@ -252,10 +259,13 @@ where
 /// within the deadline, [`RequestError::Closed`], [`RequestError::TooLarge`]
 /// or [`RequestError::Io`] if it cannot be read, and
 /// [`RequestError::Malformed`] if it fails parsing or validation.
-async fn serve(
-  stream: &mut TcpStream,
+async fn serve<S>(
+  stream: &mut S,
   buffer: &mut Vec<u8>,
-) -> Result<(Request, Response), RequestError> {
+) -> Result<(Request, Response), RequestError>
+where
+  S: AsyncRead + Unpin,
+{
   let Ok(read) = timeout(HEAD_TIMEOUT, read_head(stream, buffer)).await else {
     return Err(RequestError::RequestTimeout);
   };
@@ -403,12 +413,15 @@ fn publish_event(
 ///
 /// Returns [`RequestError::Closed`] if the client closes the connection before
 /// the head is complete, [`RequestError::TooLarge`] if the head exceeds 8 KiB,
-/// and [`RequestError::Io`] if reading from the socket fails, for example on a
+/// and [`RequestError::Io`] if reading from the stream fails, for example on a
 /// connection reset.
-async fn read_head(
-  stream: &mut TcpStream,
+async fn read_head<S>(
+  stream: &mut S,
   data: &mut Vec<u8>,
-) -> Result<(), RequestError> {
+) -> Result<(), RequestError>
+where
+  S: AsyncRead + Unpin,
+{
   let mut chunk = [0u8; 1024];
   loop {
     let n = stream.read(&mut chunk).await?;
@@ -443,6 +456,7 @@ mod tests {
 
   use serde_json::Value;
   use tokio::net::TcpListener;
+  use tokio::net::TcpStream;
   use tokio::sync::broadcast;
 
   use crate::websocket::Frame;
@@ -732,6 +746,39 @@ mod tests {
       .await??;
 
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn a_request_is_answered_over_any_stream_type() -> TestResult {
+    // An in-memory pipe instead of a socket: `handle` only needs a stream it
+    // can read and write, so the same code will serve TLS connections.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let peer = SocketAddr::from(([203, 0, 113, 9], 51_234));
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let connection = tokio::spawn(handle(
+      server,
+      peer,
+      tx,
+      feed(),
+      1,
+      Arc::new(Semaphore::new(1)),
+      Arc::new(IpLimit::new(2)),
+    ));
+
+    client
+      .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+    drop(client);
+    let handled = timeout(Duration::from_secs(5), connection).await??;
+
+    assert!(matches!(handled, Ok(())));
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let event = rx.try_recv()?;
+    assert_eq!(event.peer_address, peer);
     Ok(())
   }
 
