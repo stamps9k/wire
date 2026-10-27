@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"]}
 libc = "0.2.189"
 sha1 = "0.11.0"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
