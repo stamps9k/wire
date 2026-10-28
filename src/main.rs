@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Duration;
+use tokio::time::Instant;
 
 use crate::event::Event;
 use crate::event::ShedReason;
@@ -67,6 +68,17 @@ const MAX_VIEWERS_PER_IP: u32 = 2;
 /// so this leaves room for several real users on one address while stopping
 /// one client from taking every permit in [`MAX_CONNECTIONS`].
 const MAX_IP_COUNT: u32 = 16;
+
+/// The longest a client may take to send its whole request head.
+///
+/// The deadline covers the head as a whole, not each read, so a client that
+/// sends a byte at a time is cut off as surely as one that sends nothing. A
+/// real client sends its head at once, well within this even on a slow
+/// mobile link. Until the deadline, a silent client holds a connection
+/// permit and one of its address's slots, so a short deadline frees them
+/// sooner during a flood. When it passes, the client gets 408 Request
+/// Timeout and the event is rejected with reason `timeout`.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Checks the page templates, then binds to port 8080 on all interfaces and
 /// serves each accepted connection in its own task.
@@ -166,17 +178,24 @@ async fn main() -> io::Result<()> {
     let tx_viewer_feed = tx_viewer_feed.clone();
     let viewer_pool = viewer_pool.clone();
     let viewer_ip_limit = viewer_ip_limit.clone();
+
     tokio::spawn(async move {
+      let Some(deadline) = Instant::now().checked_add(CONNECTION_TIMEOUT)
+      else {
+        return;
+      };
+      // TODO add TLS handshake
+
       let _permit = permit;
       let _ip_permit = ip_permit;
       if let Err(e) = server::handle(
         stream,
         peer,
+        connection_count,
+        deadline,
         tx,
         tx_viewer_feed,
-        connection_count,
-        viewer_pool,
-        viewer_ip_limit,
+        (viewer_pool, viewer_ip_limit),
       )
       .await
       {

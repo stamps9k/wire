@@ -6,7 +6,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::SystemTime;
 
 use tokio::io::AsyncRead;
@@ -16,7 +15,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use crate::event;
 use crate::event::Event;
@@ -30,17 +31,6 @@ use crate::http::Status;
 use crate::server::IpLimit;
 use crate::server::viewer;
 use crate::site;
-
-/// The longest a client may take to send its whole request head.
-///
-/// The deadline covers the head as a whole, not each read, so a client that
-/// sends a byte at a time is cut off as surely as one that sends nothing. A
-/// real client sends its head at once, well within this even on a slow
-/// mobile link. Until the deadline, a silent client holds a connection
-/// permit and one of its address's slots, so a short deadline frees them
-/// sooner during a flood. When it passes, the client gets 408 Request
-/// Timeout and the event is rejected with reason `timeout`.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest writing a response to a client may take.
 ///
@@ -105,18 +95,20 @@ const LINGER_CAP: usize = 64 * 1024;
 ///
 /// # Errors
 ///
-/// Returns the [`RequestError`] from reading, parsing or validating the
-/// request, after any error response has been written. Returns
-/// [`RequestError::Io`] if writing the response fails or takes longer than
-/// [`RESPONSE_TIMEOUT`], or if reading from or writing to a viewer fails.
+/// Returns [`RequestError::RequestTimeout`] if the request head is not
+/// complete by `deadline`, and otherwise the [`RequestError`] from reading,
+/// parsing or validating the request, in both cases after any error
+/// response has been written. Returns [`RequestError::Io`] if writing the
+/// response fails or takes longer than [`RESPONSE_TIMEOUT`], or if reading from
+/// or writing to a viewer fails.
 pub async fn handle<S>(
   mut stream: S,
   addr: SocketAddr,
+  connection_id: u64,
+  deadline: Instant,
   tx_event: Sender<Event>,
   tx_viewer_feed: Sender<Arc<[u8]>>,
-  connection_id: u64,
-  viewer_pool: Arc<Semaphore>,
-  viewer_ip_limit: Arc<IpLimit>,
+  (viewer_pool, viewer_ip_limit): (Arc<Semaphore>, Arc<IpLimit>),
 ) -> Result<(), RequestError>
 where
   S: AsyncRead + AsyncWrite + Unpin,
@@ -125,7 +117,9 @@ where
   let started = Instant::now();
   let mut buffer: Vec<u8> = Vec::new();
 
-  let mut result = serve(&mut stream, &mut buffer).await;
+  let mut result = timeout_at(deadline, serve(&mut stream, &mut buffer))
+    .await
+    .unwrap_or(Err(RequestError::RequestTimeout));
 
   // Held until handle returns, so the viewer's address permit and slot stay
   // taken while streaming.
@@ -245,19 +239,19 @@ where
 
 /// Reads one request from `stream` and decides the response.
 ///
-/// Reads the head into `buffer` within [`HEAD_TIMEOUT`], then parses,
-/// validates and routes it. Returns the request together with the response
-/// chosen for it. Nothing is written to the stream.
+/// Reads the head into `buffer`, then parses, validates and routes it.
+/// Returns the request together with the response chosen for it. Nothing is
+/// written to the stream. There is no time limit here: the caller runs this
+/// under the connection's deadline.
 ///
 /// `buffer` belongs to the caller so that the bytes received can still be
 /// counted when this function fails. That includes a timeout, where the
-/// read is cancelled part-way.
+/// caller cancels the read part-way.
 ///
 /// # Errors
 ///
-/// Returns [`RequestError::RequestTimeout`] if the head is not complete
-/// within the deadline, [`RequestError::Closed`], [`RequestError::TooLarge`]
-/// or [`RequestError::Io`] if it cannot be read, and
+/// Returns [`RequestError::Closed`], [`RequestError::TooLarge`] or
+/// [`RequestError::Io`] if the head cannot be read, and
 /// [`RequestError::Malformed`] if it fails parsing or validation.
 async fn serve<S>(
   stream: &mut S,
@@ -266,10 +260,7 @@ async fn serve<S>(
 where
   S: AsyncRead + Unpin,
 {
-  let Ok(read) = timeout(HEAD_TIMEOUT, read_head(stream, buffer)).await else {
-    return Err(RequestError::RequestTimeout);
-  };
-  read?;
+  read_head(stream, buffer).await?;
 
   let request = Request::parse(buffer)?;
   request.validate()?;
@@ -461,6 +452,19 @@ mod tests {
 
   use crate::websocket::Frame;
 
+  /// How long the tests give a client to send its request head, from when
+  /// `handle` is started.
+  const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+  /// The deadline for a connection started now: [`TEST_TIMEOUT`] from now.
+  /// Falls back to now in the impossible case that the addition overflows,
+  /// which would only make a test time out at once.
+  fn deadline() -> Instant {
+    Instant::now()
+      .checked_add(TEST_TIMEOUT)
+      .unwrap_or_else(Instant::now)
+  }
+
   type TestResult = Result<(), Box<dyn Error>>;
 
   const UPGRADE: &[u8] = b"GET /ws HTTP/1.1\r\n\
@@ -507,8 +511,16 @@ mod tests {
     let address = listener.local_addr()?;
     tokio::spawn(async move {
       if let Ok((stream, peer)) = listener.accept().await {
-        let _ =
-          handle(stream, peer, tx, feed, 1, viewers, viewer_ip_limit).await;
+        let _ = handle(
+          stream,
+          peer,
+          1,
+          deadline(),
+          tx,
+          feed,
+          (viewers, viewer_ip_limit),
+        )
+        .await;
       }
     });
     TcpStream::connect(address).await
@@ -606,9 +618,9 @@ mod tests {
     // The clock is paused and jumps ahead whenever every task is waiting, so
     // this runs at once. Twice the deadline leaves room for the server's own.
     let mut response = Vec::new();
-    timeout(HEAD_TIMEOUT * 2, client.read_to_end(&mut response)).await??;
+    timeout(TEST_TIMEOUT * 2, client.read_to_end(&mut response)).await??;
     assert!(response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"));
-    let event = timeout(HEAD_TIMEOUT, rx.recv()).await??;
+    let event = timeout(TEST_TIMEOUT, rx.recv()).await??;
     assert!(matches!(
       event.kind,
       Kind::Rejected {
@@ -759,11 +771,11 @@ mod tests {
     let connection = tokio::spawn(handle(
       server,
       peer,
+      1,
+      deadline(),
       tx,
       feed(),
-      1,
-      Arc::new(Semaphore::new(1)),
-      Arc::new(IpLimit::new(2)),
+      (Arc::new(Semaphore::new(1)), Arc::new(IpLimit::new(2))),
     ));
 
     client
