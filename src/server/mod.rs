@@ -4,10 +4,12 @@
 
 mod connection;
 mod ip_limit;
+mod tls;
 mod viewer;
 mod viewer_feed;
 
 pub use connection::handle;
 pub use connection::shed;
 pub use ip_limit::IpLimit;
+pub use tls::acceptor;
 pub use viewer_feed::run_viewer_feed;
