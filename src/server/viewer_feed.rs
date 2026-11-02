@@ -210,6 +210,7 @@ mod tests {
 
   use crate::event::RejectReason;
   use crate::event::ShedReason;
+  use crate::event::Transport;
   use crate::http::HostClass;
 
   type TestResult = Result<(), Box<dyn Error>>;
@@ -242,6 +243,7 @@ mod tests {
     Event {
       connection_id,
       peer_address: SocketAddr::from(([203, 0, 113, 9], 51_234)),
+      transport: Transport::Plain,
       timestamp_ms: 1_700_000_000_000,
       duration_ms: 12,
       bytes_received: 78,
@@ -402,6 +404,21 @@ mod tests {
     assert!(text.contains(r#""peer_address":"203.0.113.0:0""#));
     assert!(!text.contains("203.0.113.9"));
     assert!(!text.contains("51234"));
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn keeps_the_transport() -> TestResult {
+    let (events, mut viewer, _task) = start(16);
+    let _ = events.send(Event {
+      transport: Transport::Tls,
+      ..event(1)
+    });
+
+    let frame = timeout(WAIT, viewer.recv()).await??;
+
+    let text = String::from_utf8_lossy(&frame);
+    assert!(text.contains(r#""transport":"tls""#));
     Ok(())
   }
 

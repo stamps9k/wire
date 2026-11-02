@@ -133,6 +133,7 @@ mod tests {
   use crate::event::Kind;
   use crate::event::RejectReason;
   use crate::event::ShedReason;
+  use crate::event::Transport;
   use crate::http::HostClass;
 
   /// A request kind with `status`, for counting tests.
@@ -208,6 +209,7 @@ mod tests {
     let event = Event {
       connection_id: 7,
       peer_address: SocketAddr::from(([203, 0, 113, 0], 0)),
+      transport: Transport::Plain,
       timestamp_ms: 1234,
       duration_ms: 5,
       bytes_received: 40,

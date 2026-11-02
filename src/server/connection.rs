@@ -12,6 +12,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Duration;
@@ -19,17 +20,21 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use tokio::time::timeout_at;
 
+use tokio_rustls::TlsAcceptor;
+
 use crate::event;
 use crate::event::Event;
 use crate::event::Kind;
 use crate::event::RejectReason;
 use crate::event::ShedReason;
+use crate::event::Transport;
 use crate::event::timestamp_ms;
 use crate::http::Request;
 use crate::http::RequestError;
 use crate::http::Response;
 use crate::http::Status;
 use crate::server::IpLimit;
+use crate::server::ip_limit::IpPermit;
 use crate::server::viewer;
 use crate::site;
 
@@ -43,6 +48,22 @@ use crate::site;
 /// link. It matches the viewers' write timeout, which covers every write
 /// once a connection has been upgraded.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest a client may take, from the start of its connection's task,
+/// to finish the TLS handshake (on the TLS port) and send its whole request
+/// head.
+///
+/// It is one deadline for both, not a timeout per step or per read, so a
+/// client that sends a byte at a time is cut off as surely as one that sends
+/// nothing, and time spent on the handshake is taken from the time left for
+/// the head. A real client does both at once, well within this even on a
+/// slow mobile link. Until the deadline, a silent client holds a connection
+/// permit and one of its address's slots, so a short deadline frees them
+/// sooner during a flood. If it passes during the head, the client gets 408
+/// Request Timeout and the event is rejected with reason `timeout`. If it
+/// passes during the handshake, the connection is closed without a response,
+/// since no HTTP has been spoken yet.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest [`lingering_close`] waits for a client to close its side.
 ///
@@ -75,10 +96,17 @@ const LINGER_CAP: usize = 64 * 1024;
 ///
 /// One [`Event`] describing the connection is sent on `tx_event` after the
 /// write, whatever the outcome. `tx_viewer_feed` is the viewer feed,
-/// which a connection that becomes a viewer subscribes to. `connection_id`
-/// is the number given to this connection when it was accepted.
+/// which a connection that becomes a viewer subscribes to.
+///
 /// `viewer_pool` holds the slots for WebSocket viewers, and
 /// `viewer_ip_limit` limits how many of them one client address may hold.
+///
+/// The connection is described by the tuple of its id (the number given to
+/// it when it was accepted), the client's address, the [`Transport`] it
+/// arrived on, and the wall-clock and monotonic times it was accepted. The
+/// caller takes those times, so time spent before this function is called,
+/// such as a TLS handshake, counts towards the event's timestamp and
+/// duration.
 ///
 /// If the response is 101 Switching Protocols, a permit is taken from
 /// `viewer_ip_limit` for the client's address and then a slot from
@@ -104,8 +132,12 @@ const LINGER_CAP: usize = 64 * 1024;
 /// or writing to a viewer fails.
 pub async fn handle<S>(
   mut stream: S,
-  addr: SocketAddr,
-  connection_id: u64,
+  (connection_id, addr, transport, (start_time, started)): (
+    u64,
+    SocketAddr,
+    Transport,
+    (SystemTime, Instant),
+  ),
   deadline: Instant,
   tx_event: Sender<Event>,
   tx_viewer_feed: Sender<Arc<[u8]>>,
@@ -114,8 +146,6 @@ pub async fn handle<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let start_time = SystemTime::now();
-  let started = Instant::now();
   let mut buffer: Vec<u8> = Vec::new();
 
   let mut result = timeout_at(deadline, serve(&mut stream, &mut buffer))
@@ -165,13 +195,10 @@ where
   let viewer = upgraded.then(|| tx_viewer_feed.subscribe());
 
   publish_event(
-    connection_id,
-    addr,
+    (connection_id, addr, transport, (start_time, started)),
     &tx_event,
     result.as_ref(),
     buffer.len(),
-    &start_time,
-    started,
   );
 
   written?;
@@ -183,6 +210,74 @@ where
   }
 
   result.map(|_| ())
+}
+
+/// Serves one accepted connection from start to finish, holding its
+/// connection permit and address permit until it ends.
+///
+/// The connection's deadline is [`CONNECTION_TIMEOUT`] from its start time.
+/// If `tls` is given, the TLS handshake is done first, under that same
+/// deadline, and a handshake that fails or runs out of time closes the
+/// connection without a response. The stream, or the TLS stream on top of
+/// it, is then served by [`handle`]. Errors from `handle` are logged on
+/// stderr together with the client's address.
+///
+/// Generic over the stream, so tests can drive it over an in-memory pipe.
+pub async fn run_connection<S>(
+  stream: S,
+  tls: Option<TlsAcceptor>,
+  (connection_id, addr, transport, (start_time, started)): (
+    u64,
+    SocketAddr,
+    Transport,
+    (SystemTime, Instant),
+  ),
+  tx_event: Sender<Event>,
+  tx_viewer_feed: Sender<Arc<[u8]>>,
+  viewer_limits: (Arc<Semaphore>, Arc<IpLimit>),
+  _permits: (OwnedSemaphorePermit, IpPermit),
+) where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let Some(deadline) = started.checked_add(CONNECTION_TIMEOUT) else {
+    return;
+  };
+
+  match tls {
+    Some(acceptor) => {
+      let Ok(Ok(tls_stream)) =
+        timeout_at(deadline, acceptor.accept(stream)).await
+      else {
+        return; // TODO item 9: publish an event for the failed handshake
+      };
+      if let Err(e) = handle(
+        tls_stream,
+        (connection_id, addr, transport, (start_time, started)),
+        deadline,
+        tx_event,
+        tx_viewer_feed,
+        viewer_limits,
+      )
+      .await
+      {
+        eprintln!("{addr}: {e}");
+      }
+    }
+    None => {
+      if let Err(e) = handle(
+        stream,
+        (connection_id, addr, transport, (start_time, started)),
+        deadline,
+        tx_event,
+        tx_viewer_feed,
+        viewer_limits,
+      )
+      .await
+      {
+        eprintln!("{addr}: {e}");
+      }
+    }
+  }
 }
 
 /// Closes the client's connection without losing the response just written.
@@ -277,12 +372,14 @@ where
 /// The event is [`Kind::Shed`] with `reason`. Nothing was read from the
 /// connection or written to it, so its duration and byte count are 0 and it
 /// has no TCP snapshot. `connection_id` is the number given to the
-/// connection when it was accepted, and the timestamp is the current time.
+/// connection when it was accepted, `transport` is the listener that
+/// accepted it, and the timestamp is the current time.
 ///
 /// A failed send only means that nobody is subscribed, so it is ignored.
 pub fn shed(
   connection_id: u64,
   addr: SocketAddr,
+  transport: Transport,
   reason: ShedReason,
   tx: &Sender<Event>,
 ) {
@@ -291,6 +388,7 @@ pub fn shed(
   let _ = tx.send(Event {
     connection_id,
     peer_address: addr,
+    transport,
     timestamp_ms: timestamp_ms(SystemTime::now()),
     duration_ms: 0,
     bytes_received: 0,
@@ -306,19 +404,22 @@ pub fn shed(
 /// from the client is cut to [`event::CAP_SIZE`] bytes, and its original
 /// length is recorded separately.
 ///
-/// `request_length` is the number of bytes read from the client.
-/// `start_time` gives the event its timestamp, and `started` is used to
-/// measure how long the connection took.
+/// `request_length` is the number of bytes read from the client. The
+/// connection's id, address and [`Transport`] are copied into the event as
+/// given; `start_time` gives the event its timestamp, and `started` is used
+/// to measure how long the connection took.
 ///
 /// A failed send only means that nobody is subscribed, so it is ignored.
 fn publish_event(
-  connection_id: u64,
-  addr: SocketAddr,
+  (connection_id, addr, transport, (start_time, started)): (
+    u64,
+    SocketAddr,
+    Transport,
+    (SystemTime, Instant),
+  ),
   tx: &Sender<Event>,
   result: Result<&(Request, Response), &RequestError>,
   request_length: usize,
-  start_time: &SystemTime,
-  started: Instant,
 ) {
   let kind = match result {
     Ok((request, response)) => {
@@ -370,7 +471,8 @@ fn publish_event(
   let _ = tx.send(Event {
     connection_id,
     peer_address: addr,
-    timestamp_ms: timestamp_ms(*start_time),
+    transport,
+    timestamp_ms: timestamp_ms(start_time),
     duration_ms: u64::try_from(started.elapsed().as_millis())
       .unwrap_or(u64::MAX),
     bytes_received,
@@ -441,6 +543,19 @@ mod tests {
   /// `handle` is started.
   const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+  /// Describes a plain connection from `peer`, as connection 1, starting
+  /// now.
+  fn plain(
+    peer: SocketAddr,
+  ) -> (u64, SocketAddr, Transport, (SystemTime, Instant)) {
+    (
+      1,
+      peer,
+      Transport::Plain,
+      (SystemTime::now(), Instant::now()),
+    )
+  }
+
   /// The deadline for a connection started now: [`TEST_TIMEOUT`] from now.
   /// Falls back to now in the impossible case that the addition overflows,
   /// which would only make a test time out at once.
@@ -498,8 +613,7 @@ mod tests {
       if let Ok((stream, peer)) = listener.accept().await {
         let _ = handle(
           stream,
-          peer,
-          1,
+          plain(peer),
           deadline(),
           tx,
           feed,
@@ -551,6 +665,7 @@ mod tests {
     Event {
       connection_id,
       peer_address: SocketAddr::from(([203, 0, 113, 9], 51_234)),
+      transport: Transport::Plain,
       timestamp_ms: 1_700_000_000_000,
       duration_ms: 12,
       bytes_received: 78,
@@ -578,10 +693,11 @@ mod tests {
   fn shed_publishes_an_event_with_nothing_read() -> TestResult {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
     let peer = SocketAddr::from(([203, 0, 113, 9], 51_234));
-    shed(5, peer, ShedReason::IpLimit, &tx);
+    shed(5, peer, Transport::Tls, ShedReason::IpLimit, &tx);
     let event = rx.try_recv()?;
     assert_eq!(event.connection_id, 5);
     assert_eq!(event.peer_address, peer);
+    assert!(matches!(event.transport, Transport::Tls));
     assert!(event.timestamp_ms > 0);
     assert_eq!(event.duration_ms, 0);
     assert_eq!(event.bytes_received, 0);
@@ -755,8 +871,7 @@ mod tests {
     let (tx, mut rx) = broadcast::channel::<Event>(16);
     let connection = tokio::spawn(handle(
       server,
-      peer,
-      1,
+      plain(peer),
       deadline(),
       tx,
       feed(),
@@ -776,6 +891,43 @@ mod tests {
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     let event = rx.try_recv()?;
     assert_eq!(event.peer_address, peer);
+    Ok(())
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_event_uses_the_transport_and_start_time_it_is_given()
+  -> TestResult {
+    // Time spent before handle starts, such as a TLS handshake, must count
+    // towards the connection's duration.
+    let start = (SystemTime::now(), Instant::now());
+    tokio::time::advance(Duration::from_secs(3)).await;
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let peer = SocketAddr::from(([203, 0, 113, 9], 51_234));
+    let (tx, mut rx) = broadcast::channel::<Event>(16);
+    let connection = tokio::spawn(handle(
+      server,
+      (1, peer, Transport::Tls, start),
+      deadline(),
+      tx,
+      feed(),
+      (Arc::new(Semaphore::new(1)), Arc::new(IpLimit::new(2))),
+    ));
+
+    client
+      .write_all(b"GET / HTTP/1.1\r\nHost: wire.stampatron.com\r\n\r\n")
+      .await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+      .await??;
+    drop(client);
+    let handled = timeout(Duration::from_secs(5), connection).await??;
+
+    assert!(matches!(handled, Ok(())));
+    let event = rx.try_recv()?;
+    assert!(matches!(event.transport, Transport::Tls));
+    assert_eq!(event.timestamp_ms, timestamp_ms(start.0));
+    assert!(event.duration_ms >= 3000);
     Ok(())
   }
 

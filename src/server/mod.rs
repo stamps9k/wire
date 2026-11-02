@@ -8,7 +8,7 @@ mod tls;
 mod viewer;
 mod viewer_feed;
 
-pub use connection::handle;
+pub use connection::run_connection;
 pub use connection::shed;
 pub use ip_limit::IpLimit;
 pub use tls::acceptor;

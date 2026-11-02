@@ -196,6 +196,7 @@ mod tests {
   use crate::event::Event;
   use crate::event::Kind;
   use crate::event::RejectReason;
+  use crate::event::Transport;
 
   use std::error::Error;
   use std::net::SocketAddr;
@@ -229,6 +230,7 @@ mod tests {
     Event {
       connection_id,
       peer_address: SocketAddr::from(([203, 0, 113, 9], 51_234)),
+      transport: Transport::Plain,
       timestamp_ms: 1_700_000_000_000,
       duration_ms: 12,
       bytes_received: 78,

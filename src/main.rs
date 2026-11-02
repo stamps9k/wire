@@ -4,6 +4,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -11,10 +12,10 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Duration;
 use tokio::time::Instant;
-use tokio::time::timeout_at;
 
 use crate::event::Event;
 use crate::event::ShedReason;
+use crate::event::Transport;
 use crate::server::IpLimit;
 use crate::server::run_viewer_feed;
 use crate::site::validate_templates;
@@ -71,22 +72,6 @@ const MAX_VIEWERS_PER_IP: u32 = 2;
 /// one client from taking every permit in [`MAX_CONNECTIONS`].
 const MAX_IP_COUNT: u32 = 16;
 
-/// The longest a client may take, from the start of its connection's task,
-/// to finish the TLS handshake (on the TLS port) and send its whole request
-/// head.
-///
-/// It is one deadline for both, not a timeout per step or per read, so a
-/// client that sends a byte at a time is cut off as surely as one that sends
-/// nothing, and time spent on the handshake is taken from the time left for
-/// the head. A real client does both at once, well within this even on a
-/// slow mobile link. Until the deadline, a silent client holds a connection
-/// permit and one of its address's slots, so a short deadline frees them
-/// sooner during a flood. If it passes during the head, the client gets 408
-/// Request Timeout and the event is rejected with reason `timeout`. If it
-/// passes during the handshake, the connection is closed without a response,
-/// since no HTTP has been spoken yet.
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// The certificate chain for the TLS port, as PEM: the leaf for
 /// wire.stampatron.com followed by its intermediates. The compose files
 /// mount the certificate volume read-only at `/tls`.
@@ -101,10 +86,10 @@ const WIRE_TLS_KEY: &str = "/tls/wire.stampatron.com.key";
 /// and serves each accepted connection in its own task.
 ///
 /// One loop accepts from both ports, so connections from either are numbered
-/// and limited the same way. A TLS connection does its handshake in its own
-/// task, under the same deadline as its request head (see
-/// [`CONNECTION_TIMEOUT`]), and then is served like a plain one. A handshake
-/// that fails or runs out of time closes the connection.
+/// and limited the same way. Each accepted connection is served in its own
+/// task by [`server::run_connection`], which does the TLS handshake for
+/// connections on the TLS port. A handshake that fails or runs out of time
+/// closes the connection.
 ///
 /// Each client address may have at most [`MAX_IP_COUNT`] connections open,
 /// and at most [`MAX_CONNECTIONS`] are served at once in total. The address
@@ -163,9 +148,13 @@ async fn main() -> io::Result<()> {
   tokio::spawn(run_viewer_feed(rx_viewer_feed, tx_viewer_feed.clone()));
 
   loop {
-    let (accepted, tls) = tokio::select! {
-      result = listener.accept() => (result, None),
-      result = listener_tls.accept() => (result, Some(acceptor.clone())),
+    let (accepted, transport, tls) = tokio::select! {
+      result = listener.accept() => (result, Transport::Plain, None),
+      result = listener_tls.accept() => (
+        result,
+        Transport::Tls,
+        Some(acceptor.clone()),
+      ),
     };
 
     let (stream, peer) = match accepted {
@@ -180,12 +169,24 @@ async fn main() -> io::Result<()> {
     connection_count = connection_count.wrapping_add(1);
 
     let Some(ip_permit) = connection_ip_limit.try_acquire(peer.ip()) else {
-      server::shed(connection_count, peer, ShedReason::IpLimit, &tx_events);
+      server::shed(
+        connection_count,
+        peer,
+        transport,
+        ShedReason::IpLimit,
+        &tx_events,
+      );
       continue;
     };
 
     let Ok(permit) = connection_pool.clone().try_acquire_owned() else {
-      server::shed(connection_count, peer, ShedReason::Capacity, &tx_events);
+      server::shed(
+        connection_count,
+        peer,
+        transport,
+        ShedReason::Capacity,
+        &tx_events,
+      );
       continue;
     };
 
@@ -194,53 +195,17 @@ async fn main() -> io::Result<()> {
     let viewer_pool = viewer_pool.clone();
     let viewer_ip_limit = viewer_ip_limit.clone();
 
-    tokio::spawn(async move {
-      let Some(deadline) = Instant::now().checked_add(CONNECTION_TIMEOUT)
-      else {
-        return;
-      };
-
-      let _permit = permit;
-      let _ip_permit = ip_permit;
-
-      match tls {
-        Some(acceptor) => {
-          let Ok(Ok(tls_stream)) =
-            timeout_at(deadline, acceptor.accept(stream)).await
-          else {
-            return; // TODO item 9: publish an event for the failed handshake
-          };
-          if let Err(e) = server::handle(
-            tls_stream,
-            peer,
-            connection_count,
-            deadline,
-            tx,
-            tx_viewer_feed,
-            (viewer_pool, viewer_ip_limit),
-          )
-          .await
-          {
-            eprintln!("{peer}: {e}");
-          }
-        }
-        None => {
-          if let Err(e) = server::handle(
-            stream,
-            peer,
-            connection_count,
-            deadline,
-            tx,
-            tx_viewer_feed,
-            (viewer_pool, viewer_ip_limit),
-          )
-          .await
-          {
-            eprintln!("{peer}: {e}");
-          }
-        }
-      }
-    });
+    let start_time = SystemTime::now();
+    let started = Instant::now();
+    tokio::spawn(server::run_connection(
+      stream,
+      tls,
+      (connection_count, peer, transport, (start_time, started)),
+      tx,
+      tx_viewer_feed,
+      (viewer_pool, viewer_ip_limit),
+      (permit, ip_permit),
+    ));
   }
 }
 

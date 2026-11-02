@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::event::Kind;
 use crate::event::TcpSnapshot;
+use crate::event::Transport;
 
 /// Longest text, in bytes, that an event carries for any one field taken
 /// from the client.
@@ -40,6 +41,8 @@ pub struct Event {
   /// The client's full IP address and port. Logged in full; viewers
   /// receive only the network (see `server::viewer`).
   pub peer_address: SocketAddr,
+  /// Which listener accepted the connection.
+  pub transport: Transport,
   /// When the connection was accepted, in milliseconds since the Unix
   /// epoch.
   pub timestamp_ms: u64,
@@ -69,6 +72,7 @@ mod tests {
     Event {
       connection_id: 7,
       peer_address: SocketAddr::from(([203, 0, 113, 9], 51_234)),
+      transport: Transport::Plain,
       timestamp_ms: 1_700_000_000_000,
       duration_ms: 12,
       bytes_received: 78,
@@ -106,6 +110,7 @@ mod tests {
   const COMMON: &str = concat!(
     r#"{"connection_id":7,"#,
     r#""peer_address":"203.0.113.9:51234","#,
+    r#""transport":"plain","#,
     r#""timestamp_ms":1700000000000,"#,
     r#""duration_ms":12,"#,
     r#""bytes_received":78,"#,
@@ -224,6 +229,20 @@ mod tests {
     event.peer_address = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080));
     let json = serde_json::to_string(&event)?;
     assert!(json.contains(r#""peer_address":"[::1]:8080","#));
+    Ok(())
+  }
+
+  #[test]
+  fn a_tls_connection_is_marked_after_the_peer_address()
+  -> Result<(), serde_json::Error> {
+    let mut event = event(rejected(RejectReason::Closed, None, None));
+    event.transport = Transport::Tls;
+    let json = serde_json::to_string(&event)?;
+    let expected = concat!(
+      r#""peer_address":"203.0.113.9:51234","#,
+      r#""transport":"tls","#,
+    );
+    assert!(json.contains(expected));
     Ok(())
   }
 
