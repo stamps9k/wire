@@ -12,6 +12,7 @@ mod record;
 mod reject_reason;
 mod shed_reason;
 mod tcp_snapshot;
+mod timestamp;
 mod viewer_event;
 
 pub use kind::Kind;
@@ -19,6 +20,7 @@ pub use record::{CAP_SIZE, Event, truncate};
 pub use reject_reason::RejectReason;
 pub use shed_reason::ShedReason;
 use tcp_snapshot::TcpSnapshot;
+pub use timestamp::timestamp_ms;
 pub use viewer_event::Dropped;
 pub use viewer_event::Summary;
 pub use viewer_event::ViewerMessage;

@@ -15,7 +15,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::Sender;
@@ -28,6 +27,7 @@ use crate::event::Event;
 use crate::event::Kind;
 use crate::event::Summary;
 use crate::event::ViewerMessage;
+use crate::event::timestamp_ms;
 use crate::websocket::Frame;
 
 /// The most events sent to viewers in one [`FEED_WINDOW`].
@@ -72,7 +72,7 @@ pub async fn run_viewer_feed(
   // Skip the first tick
   interval.tick().await;
 
-  let mut window_start_ms = now_ms();
+  let mut window_start_ms = timestamp_ms(SystemTime::now());
 
   let mut event_count: u32 = 0;
   let mut lagged: u32 = 0;
@@ -119,7 +119,7 @@ pub async fn run_viewer_feed(
 
           publish_message(&message, &tx_viewer_feed);
         }
-        window_start_ms = now_ms();
+        window_start_ms = timestamp_ms(SystemTime::now());
         lagged = 0;
       }
     }
@@ -194,20 +194,6 @@ fn truncate_peer_address(address: SocketAddr) -> SocketAddr {
   };
 
   SocketAddr::new(masked_ip, 0)
-}
-
-/// The current time in milliseconds since the Unix epoch.
-///
-/// A clock set before the epoch gives 0, and a time too large for a `u64`
-/// gives `u64::MAX`, so this never fails.
-fn now_ms() -> u64 {
-  u64::try_from(
-    SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_millis(),
-  )
-  .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

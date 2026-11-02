@@ -24,6 +24,7 @@ use crate::event::Event;
 use crate::event::Kind;
 use crate::event::RejectReason;
 use crate::event::ShedReason;
+use crate::event::timestamp_ms;
 use crate::http::Request;
 use crate::http::RequestError;
 use crate::http::Response;
@@ -285,20 +286,12 @@ pub fn shed(
   reason: ShedReason,
   tx: &Sender<Event>,
 ) {
-  let timestamp_ms = u64::try_from(
-    SystemTime::now()
-      .duration_since(SystemTime::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_millis(),
-  )
-  .unwrap_or(u64::MAX);
-
   let kind = Kind::Shed { reason };
 
   let _ = tx.send(Event {
     connection_id,
     peer_address: addr,
-    timestamp_ms,
+    timestamp_ms: timestamp_ms(SystemTime::now()),
     duration_ms: 0,
     bytes_received: 0,
     tcp_snapshot: None,
@@ -327,14 +320,6 @@ fn publish_event(
   start_time: &SystemTime,
   started: Instant,
 ) {
-  let timestamp_ms = u64::try_from(
-    start_time
-      .duration_since(SystemTime::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_millis(),
-  )
-  .unwrap_or(u64::MAX);
-
   let kind = match result {
     Ok((request, response)) => {
       let user_agent_opt =
@@ -385,7 +370,7 @@ fn publish_event(
   let _ = tx.send(Event {
     connection_id,
     peer_address: addr,
-    timestamp_ms,
+    timestamp_ms: timestamp_ms(*start_time),
     duration_ms: u64::try_from(started.elapsed().as_millis())
       .unwrap_or(u64::MAX),
     bytes_received,
