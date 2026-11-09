@@ -41,7 +41,7 @@ const LIFETIME_CLOSE_CODE: u16 = 4000;
 /// reconnects at once and barely notices, while a client holding slots on
 /// purpose has to keep reconnecting, which gives other clients a chance to
 /// get in and shows up in the events.
-const MAX_VIEWER_LIFE: Duration = Duration::from_secs(15 * 60);
+const MAX_VIEWER_LIFE: Duration = Duration::from_mins(15);
 
 /// The longest a single write to a viewer may take.
 ///
@@ -858,7 +858,7 @@ mod tests {
     let sender = tokio::spawn(async move {
       for connection_id in 0..minutes {
         let _ = tx.send(message(connection_id));
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_mins(1)).await;
       }
     });
 
@@ -867,7 +867,7 @@ mod tests {
 
     let elapsed = started.elapsed();
     assert!(elapsed >= MAX_VIEWER_LIFE);
-    assert!(elapsed < MAX_VIEWER_LIFE + Duration::from_secs(60));
+    assert!(elapsed < MAX_VIEWER_LIFE + Duration::from_mins(1));
     let frames = frames(&written).ok_or("not a run of server frames")?;
     let messages = frames.iter().filter(|(first, _)| *first == 0x81).count();
     assert!(messages > 1, "only {messages} messages reached the viewer");

@@ -156,21 +156,21 @@ where
   // taken while streaming.
   let mut _viewer_permit = None;
   let mut viewer_ip_permit = None;
-  if let Ok((_, response)) = &mut result {
-    if matches!(response.status, Status::SwitchingProtocols) {
-      // First check whether the address is over its viewer limit.
-      match viewer_ip_limit.try_acquire(addr.ip()) {
-        Some(permit) => viewer_ip_permit = Some(permit),
-        None => *response = site::error_response(Status::ServiceUnavailable),
-      }
+  if let Ok((_, response)) = &mut result
+    && matches!(response.status, Status::SwitchingProtocols)
+  {
+    // First check whether the address is over its viewer limit.
+    match viewer_ip_limit.try_acquire(addr.ip()) {
+      Some(permit) => viewer_ip_permit = Some(permit),
+      None => *response = site::error_response(Status::ServiceUnavailable),
+    }
 
-      if viewer_ip_permit.is_some() {
-        // Then check whether every viewer slot is taken.
-        match viewer_pool.try_acquire_owned() {
-          Ok(permit) => _viewer_permit = Some(permit),
-          Err(_) => {
-            *response = site::error_response(Status::ServiceUnavailable);
-          }
+    if viewer_ip_permit.is_some() {
+      // Then check whether every viewer slot is taken.
+      match viewer_pool.try_acquire_owned() {
+        Ok(permit) => _viewer_permit = Some(permit),
+        Err(_) => {
+          *response = site::error_response(Status::ServiceUnavailable);
         }
       }
     }
