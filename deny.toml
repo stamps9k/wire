@@ -1,0 +1,11 @@
+# cargo-deny configuration. Only the advisories check is used:
+#   cargo deny check advisories
+# Any vulnerability, unmaintained or unsound advisory fails the check.
+# Accepted risks go in `ignore` with the advisory ID, a reason and a
+# revisit date, e.g.
+#   { id = "RUSTSEC-0000-0000", reason = "...; accepted YYYY-MM-DD, revisit YYYY-MM review" },
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []

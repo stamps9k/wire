@@ -8,3 +8,37 @@ fi
 
 cargo clippy --all-targets -- -D warnings
 cargo test
+
+# Security audit on dependency changes (kept last: it exits early when no
+# dependency files are staged).
+# Runs `cargo deny check advisories` against the *staged* Cargo.toml,
+# Cargo.lock and deny.toml, only when the commit touches one of them.
+# Exceptions live in deny.toml. Bypass in an emergency with:
+#   git commit --no-verify
+# Installed into .git/hooks by cargo-husky on `cargo test`.
+
+git diff --cached --name-only | grep -qxE 'Cargo\.(toml|lock)|deny\.toml' || exit 0
+
+if ! command -v cargo-deny >/dev/null 2>&1; then
+  echo "pre-commit: cargo-deny not found. Install with: cargo install --locked cargo-deny" >&2
+  exit 1
+fi
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+for f in Cargo.toml Cargo.lock deny.toml; do
+  git show ":$f" > "$tmp/$f" 2>/dev/null || {
+    echo "pre-commit: $f is not staged or tracked; stage it too." >&2
+    exit 1
+  }
+done
+# cargo needs a target to read the manifest; the code itself isn't audited.
+mkdir "$tmp/src" && : > "$tmp/src/lib.rs"
+
+echo "pre-commit: dependency files changed, running cargo deny check advisories..."
+if ! cargo deny --manifest-path "$tmp/Cargo.toml" --locked check advisories; then
+  echo "pre-commit: security audit failed. Fix or ignore (with a reason) in deny.toml," >&2
+  echo "or stage an up-to-date Cargo.lock if cargo reported it needs updating." >&2
+  exit 1
+fi
