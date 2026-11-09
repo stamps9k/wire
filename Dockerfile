@@ -2,7 +2,7 @@
 FROM rust:1-trixie AS chef
 WORKDIR /app
 COPY rust-toolchain.toml .
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 FROM chef AS planner
 COPY . .
