@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1-trixie AS chef
+FROM rust:1.99-trixie AS chef
 WORKDIR /app
 COPY rust-toolchain.toml .
 RUN cargo install cargo-chef --locked --version 0.1.78
